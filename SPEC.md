@@ -1,8 +1,9 @@
-# Symphony Service Specification
+# Symphony GitLab Service Specification
 
-Status: Draft v1 (language-agnostic)
+Status: Draft v2 (GitLab-only, language-agnostic)
 
-Purpose: Define a service that orchestrates coding agents to get project work done.
+Purpose: Define a service that orchestrates coding agents to get project work done using GitLab as
+the only task-management, repository, branch, and merge-request channel.
 
 ## Normative Language
 
@@ -15,44 +16,54 @@ behavior.
 
 ## 1. Problem Statement
 
-Symphony is a long-running automation service that continuously reads work from an issue tracker
-(Linear in this specification version), creates an isolated workspace for each issue, and runs a
-coding agent session for that issue inside the workspace.
+Symphony is a long-running automation service that continuously reads work from GitLab Issues,
+creates an isolated GitLab-backed workspace for each eligible issue, and runs a coding agent session
+for that issue inside the workspace.
 
-The service solves four operational problems:
+The service solves five operational problems:
 
-- It turns issue execution into a repeatable daemon workflow instead of manual scripts.
+- It turns GitLab issue execution into a repeatable daemon workflow instead of manual scripts.
 - It isolates agent execution in per-issue workspaces so agent commands run only inside per-issue
   workspace directories.
-- It keeps the workflow policy in-repo (`WORKFLOW.md`) so teams version the agent prompt and runtime
-  settings with their code.
+- It makes GitLab the authoritative source for task selection, code checkout, branch creation,
+  merge-request handoff, and operator-visible issue updates.
+- It keeps the workflow policy in-repository (`WORKFLOW.md`) so teams version the agent prompt and
+  runtime settings with their code.
 - It provides enough observability to operate and debug multiple concurrent agent runs.
+
+Important boundaries:
+
+- Symphony is a scheduler, GitLab reader/writer, repository preparer, and agent runner.
+- GitLab Issues are the task source.
+- GitLab repositories are the only code source.
+- GitLab Merge Requests are the normal handoff artifact for completed code work.
+- A successful run can end at a workflow-defined handoff state, such as a draft merge request with a
+  review label, not necessarily a closed issue.
+- Implementations MUST NOT use any non-GitLab service as a core task tracker or code retrieval
+  channel for core conformance.
 
 Implementations are expected to document their trust and safety posture explicitly. This
 specification does not require a single approval, sandbox, or operator-confirmation policy; some
 implementations target trusted environments with a high-trust configuration, while others require
 stricter approvals or sandboxing.
 
-Important boundary:
-
-- Symphony is a scheduler/runner and tracker reader.
-- Ticket writes (state transitions, comments, PR links) are typically performed by the coding agent
-  using tools available in the workflow/runtime environment.
-- A successful run can end at a workflow-defined handoff state (for example `Human Review`), not
-  necessarily `Done`.
-
 ## 2. Goals and Non-Goals
 
 ### 2.1 Goals
 
-- Poll the issue tracker on a fixed cadence and dispatch work with bounded concurrency.
+- Poll GitLab on a fixed cadence and dispatch work with bounded concurrency.
 - Maintain a single authoritative orchestrator state for dispatch, retries, and reconciliation.
+- Use GitLab issue labels as the scheduling state machine.
 - Create deterministic per-issue workspaces and preserve them across runs.
-- Stop active runs when issue state changes make them ineligible.
+- Clone, fetch, branch, and push only GitLab repository remotes derived from the configured GitLab
+  project.
+- Stop active runs when GitLab issue state or labels make them ineligible.
 - Recover from transient failures with exponential backoff.
+- Create or update GitLab Merge Requests as the standard code handoff.
 - Load runtime behavior from a repository-owned `WORKFLOW.md` contract.
-- Expose operator-visible observability (at minimum structured logs).
-- Support tracker/filesystem-driven restart recovery without requiring a persistent database; exact
+- Expose operator-visible observability, at minimum structured logs and GitLab issue notes for
+  important lifecycle events.
+- Support GitLab/filesystem-driven restart recovery without requiring a persistent database; exact
   in-memory scheduler state is not restored.
 
 ### 2.2 Non-Goals
@@ -60,8 +71,8 @@ Important boundary:
 - Rich web UI or multi-tenant control plane.
 - Prescribing a specific dashboard or terminal UI implementation.
 - General-purpose workflow engine or distributed job scheduler.
-- Built-in business logic for how to edit tickets, PRs, or comments. (That logic lives in the
-  workflow prompt and agent tooling.)
+- Supporting task trackers or repository hosts other than GitLab in core conformance.
+- Replacing GitLab CI, code review, approval rules, or protected branch policy.
 - Mandating strong sandbox controls beyond what the coding agent and host OS provide.
 - Mandating a single default approval, sandbox, or operator-confirmation posture for all
   implementations.
@@ -80,103 +91,160 @@ Important boundary:
    - Applies defaults and environment variable indirection.
    - Performs validation used by the orchestrator before dispatch.
 
-3. `Issue Tracker Client`
-   - Fetches candidate issues in active states.
-   - Fetches current states for specific issue IDs (reconciliation).
-   - Fetches terminal-state issues during startup cleanup.
-   - Normalizes tracker payloads into a stable issue model.
+3. `GitLab Client`
+   - Fetches configured project metadata.
+   - Fetches candidate issues by project, state, labels, and optional filters.
+   - Fetches current issue state, labels, links, and merge requests for reconciliation.
+   - Normalizes GitLab payloads into stable project, issue, repository, branch, and merge-request
+     models.
+   - Performs narrow write operations: label claim/release, issue notes, branch creation, and merge
+     request creation/update.
 
 4. `Orchestrator`
    - Owns the poll tick.
    - Owns the in-memory runtime state.
    - Decides which issues to dispatch, retry, stop, or release.
+   - Applies GitLab label-based claims.
    - Tracks session metrics and retry queue state.
 
 5. `Workspace Manager`
-   - Maps issue identifiers to workspace paths.
+   - Maps GitLab issue identifiers to workspace paths.
    - Ensures per-issue workspace directories exist.
+   - Clones or fetches the configured GitLab project repository.
+   - Creates or checks out the per-issue work branch.
    - Runs workspace lifecycle hooks.
-   - Cleans workspaces for terminal issues.
+   - Cleans workspaces for terminal issues when policy requires cleanup.
 
 6. `Agent Runner`
-   - Creates workspace.
-   - Builds prompt from issue + workflow template.
+   - Creates or prepares the workspace.
+   - Builds prompt from GitLab issue/project/repository context plus workflow template.
    - Launches the coding agent app-server client.
    - Streams agent updates back to the orchestrator.
 
-7. `Status Surface` (OPTIONAL)
-   - Presents human-readable runtime status (for example terminal output, dashboard, or other
-     operator-facing view).
+7. `Merge Request Manager`
+   - Detects existing open merge requests for the issue work branch.
+   - Creates or updates draft or ready merge requests according to workflow config.
+   - Records merge request URLs in issue notes and observability output.
 
-8. `Logging`
+8. `Status Surface` (OPTIONAL)
+   - Presents human-readable runtime status, for example terminal output, dashboard, or other
+     operator-facing view.
+
+9. `Logging`
    - Emits structured runtime logs to one or more configured sinks.
 
 ### 3.2 Abstraction Levels
 
 Symphony is easiest to port when kept in these layers:
 
-1. `Policy Layer` (repo-defined)
+1. `Policy Layer` (repository-defined)
    - `WORKFLOW.md` prompt body.
-   - Team-specific rules for ticket handling, validation, and handoff.
+   - Team-specific rules for issue handling, validation, review handoff, and cleanup.
 
 2. `Configuration Layer` (typed getters)
    - Parses front matter into typed runtime settings.
    - Handles defaults, environment tokens, and path normalization.
 
 3. `Coordination Layer` (orchestrator)
-   - Polling loop, issue eligibility, concurrency, retries, reconciliation.
+   - Polling loop, issue eligibility, label claims, concurrency, retries, and reconciliation.
 
-4. `Execution Layer` (workspace + agent subprocess)
-   - Filesystem lifecycle, workspace preparation, coding-agent protocol.
+4. `Execution Layer` (workspace + repository + agent subprocess)
+   - Filesystem lifecycle, GitLab clone/fetch/branch, workspace preparation, coding-agent protocol.
 
-5. `Integration Layer` (Linear adapter)
-   - API calls and normalization for tracker data.
+5. `Integration Layer` (GitLab adapter)
+   - GitLab REST API calls, Git operations against GitLab remotes, and payload normalization.
 
-6. `Observability Layer` (logs + OPTIONAL status surface)
+6. `Observability Layer` (logs + issue notes + OPTIONAL status surface)
    - Operator visibility into orchestrator and agent behavior.
 
 ### 3.3 External Dependencies
 
-- Issue tracker API (Linear for `tracker.kind: linear` in this specification version).
+- GitLab REST API v4 for project, issue, issue-link, branch, and merge-request operations.
+- Git CLI for repository clone/fetch/checkout/push unless the implementation uses an equivalent
+  Git library.
 - Local filesystem for workspaces and logs.
-- OPTIONAL workspace population tooling (for example Git CLI, if used).
 - Coding-agent executable that supports the targeted Codex app-server mode.
-- Host environment authentication for the issue tracker and coding agent.
+- Host environment authentication for GitLab and the coding agent.
 
 ## 4. Core Domain Model
 
 ### 4.1 Entities
 
-#### 4.1.1 Issue
+#### 4.1.1 GitLab Project
 
-Normalized issue record used by orchestration, prompt rendering, and observability output.
+Normalized GitLab project record used by repository preparation and API calls.
 
 Fields:
 
-- `id` (string)
-  - Stable tracker-internal ID.
+- `id` (integer or string)
+  - Stable GitLab project ID.
+- `path_with_namespace` (string)
+  - Human-readable project path, for example `group/subgroup/project`.
+- `name` (string or null)
+- `web_url` (string or null)
+- `default_branch` (string)
+- `ssh_url_to_repo` (string or null)
+- `http_url_to_repo` (string or null)
+- `visibility` (string or null)
+
+#### 4.1.2 Issue
+
+Normalized GitLab issue record used by orchestration, prompt rendering, and observability output.
+
+Fields:
+
+- `id` (integer or string)
+  - Stable GitLab global issue ID.
+- `iid` (integer)
+  - Project-local issue number used by GitLab issue endpoints.
 - `identifier` (string)
-  - Human-readable ticket key (example: `ABC-123`).
+  - Human-readable key, formatted as `<project_path>#<iid>`.
+- `project_id` (integer or string)
+- `project_path` (string)
 - `title` (string)
 - `description` (string or null)
-- `priority` (integer or null)
-  - Lower numbers are higher priority in dispatch sorting.
 - `state` (string)
-  - Current tracker state name.
-- `branch_name` (string or null)
-  - Tracker-provided branch metadata if available.
-- `url` (string or null)
+  - GitLab issue state, normally `opened` or `closed`.
 - `labels` (list of strings)
-  - Normalized to lowercase.
+  - Normalized to lowercase for scheduler comparisons.
+- `priority` (integer or null)
+  - Derived from configured priority labels or GitLab issue weight. Lower numbers sort first.
+- `weight` (integer or null)
+- `milestone` (object or null)
+- `assignees` (list of user summaries)
+- `author` (user summary or null)
+- `branch_name` (string or null)
+  - Work branch for this issue.
+- `web_url` (string or null)
 - `blocked_by` (list of blocker refs)
-  - Each blocker ref contains:
-    - `id` (string or null)
-    - `identifier` (string or null)
-    - `state` (string or null)
+  - Each blocker ref contains `id`, `iid`, `identifier`, `state`, `labels`, and `web_url` when
+    available.
+- `merge_request` (merge request summary or null)
+  - Existing or created merge request associated with the work branch.
 - `created_at` (timestamp or null)
 - `updated_at` (timestamp or null)
 
-#### 4.1.2 Workflow Definition
+#### 4.1.3 Merge Request
+
+Normalized GitLab merge request summary.
+
+Fields:
+
+- `id` (integer or string)
+- `iid` (integer)
+- `project_id` (integer or string)
+- `title` (string)
+- `description` (string or null)
+- `state` (string)
+  - Examples: `opened`, `closed`, `merged`.
+- `draft` (boolean)
+- `source_branch` (string)
+- `target_branch` (string)
+- `web_url` (string or null)
+- `merge_status` (string or null)
+- `pipeline_status` (string or null, if available)
+
+#### 4.1.4 Workflow Definition
 
 Parsed `WORKFLOW.md` payload:
 
@@ -185,44 +253,56 @@ Parsed `WORKFLOW.md` payload:
 - `prompt_template` (string)
   - Markdown body after front matter, trimmed.
 
-#### 4.1.3 Service Config (Typed View)
+#### 4.1.5 Service Config (Typed View)
 
 Typed runtime values derived from `WorkflowDefinition.config` plus environment resolution.
 
 Examples:
 
+- GitLab base URL, project path, API token, clone protocol, and label policy
 - poll interval
 - workspace root
-- active and terminal issue states
 - concurrency limits
 - coding-agent executable/args/timeouts
+- merge-request behavior
 - workspace hooks
 
-#### 4.1.4 Workspace
+#### 4.1.6 Workspace
 
-Filesystem workspace assigned to one issue identifier.
+Filesystem workspace assigned to one GitLab issue.
 
-Fields (logical):
+Fields:
 
 - `path` (absolute workspace path)
 - `workspace_key` (sanitized issue identifier)
+- `repository_path` (absolute path to the checked-out repository inside the workspace)
+- `project_id`
+- `project_path`
+- `remote_url`
+- `base_branch`
+- `work_branch`
 - `created_now` (boolean, used to gate `after_create` hook)
+- `commit_sha_before_run` (string or null)
+- `commit_sha_after_run` (string or null)
 
-#### 4.1.5 Run Attempt
+#### 4.1.7 Run Attempt
 
 One execution attempt for one issue.
 
-Fields (logical):
+Fields:
 
 - `issue_id`
+- `issue_iid`
 - `issue_identifier`
 - `attempt` (integer or null, `null` for first run, `>=1` for retries/continuation)
 - `workspace_path`
+- `repository_path`
+- `work_branch`
 - `started_at`
 - `status`
 - `error` (OPTIONAL)
 
-#### 4.1.6 Live Session (Agent Session Metadata)
+#### 4.1.8 Live Session (Agent Session Metadata)
 
 State tracked while a coding-agent subprocess is running.
 
@@ -242,22 +322,22 @@ Fields:
 - `last_reported_output_tokens` (integer)
 - `last_reported_total_tokens` (integer)
 - `turn_count` (integer)
-  - Number of coding-agent turns started within the current worker lifetime.
 
-#### 4.1.7 Retry Entry
+#### 4.1.9 Retry Entry
 
 Scheduled retry state for an issue.
 
 Fields:
 
 - `issue_id`
+- `issue_iid`
 - `identifier` (best-effort human ID for status surfaces/logs)
 - `attempt` (integer, 1-based for retry queue)
 - `due_at_ms` (monotonic clock timestamp)
 - `timer_handle` (runtime-specific timer reference)
 - `error` (string or null)
 
-#### 4.1.8 Orchestrator Runtime State
+#### 4.1.10 Orchestrator Runtime State
 
 Single authoritative in-memory state owned by the orchestrator.
 
@@ -265,6 +345,7 @@ Fields:
 
 - `poll_interval_ms` (current effective poll interval)
 - `max_concurrent_agents` (current effective global concurrency limit)
+- `project` (normalized GitLab project)
 - `running` (map `issue_id -> running entry`)
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
@@ -274,15 +355,28 @@ Fields:
 
 ### 4.2 Stable Identifiers and Normalization Rules
 
+- `Project ID`
+  - Use for GitLab project API calls after project discovery.
+- `Project Path`
+  - Use for human-readable logs and prompt context.
 - `Issue ID`
-  - Use for tracker lookups and internal map keys.
+  - Use for internal map keys when available.
+- `Issue IID`
+  - Use for project-local GitLab issue endpoints.
 - `Issue Identifier`
-  - Use for human-readable logs and workspace naming.
+  - Format as `<project_path>#<iid>`.
 - `Workspace Key`
   - Derive from `issue.identifier` by replacing any character not in `[A-Za-z0-9._-]` with `_`.
   - Use the sanitized value for the workspace directory name.
 - `Normalized Issue State`
-  - Compare states after `lowercase`.
+  - Compare issue states after `lowercase`.
+- `Normalized Label`
+  - Compare labels after `lowercase`.
+- `Branch Name`
+  - Derive from `gitlab.repository.branch_template`.
+  - Slug components MUST replace characters outside `[A-Za-z0-9._/-]` with `-`.
+  - Final branch name MUST NOT contain `..`, start with `/`, end with `/`, or contain ASCII control
+    characters.
 - `Session ID`
   - Compose from coding-agent `thread_id` and `turn_id` as `<thread_id>-<turn_id>`.
 
@@ -292,7 +386,7 @@ Fields:
 
 Workflow file path precedence:
 
-1. Explicit application/runtime setting (set by CLI startup path).
+1. Explicit application/runtime setting, set by CLI startup path.
 2. Default: `WORKFLOW.md` in the current process working directory.
 
 Loader behavior:
@@ -307,8 +401,8 @@ Loader behavior:
 Design note:
 
 - `WORKFLOW.md` SHOULD be self-contained enough to describe and run different workflows (prompt,
-  runtime settings, hooks, and tracker selection/config) without requiring out-of-band
-  service-specific configuration.
+  runtime settings, hooks, GitLab selection/config, and handoff policy) without requiring
+  out-of-band service-specific configuration.
 
 Parsing rules:
 
@@ -320,55 +414,132 @@ Parsing rules:
 
 Returned workflow object:
 
-- `config`: front matter root object (not nested under a `config` key).
+- `config`: front matter root object, not nested under a `config` key.
 - `prompt_template`: trimmed Markdown body.
 
 ### 5.3 Front Matter Schema
 
 Top-level keys:
 
-- `tracker`
+- `gitlab`
 - `polling`
 - `workspace`
 - `hooks`
 - `agent`
 - `codex`
+- `observability`
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
-Note:
-
-- The workflow front matter is extensible. Extensions MAY define additional top-level keys without
-  changing the core schema above.
-- Extensions SHOULD document their field schema, defaults, validation rules, and whether changes
-  apply dynamically or require restart.
-
-#### 5.3.1 `tracker` (object)
+#### 5.3.1 `gitlab` (object)
 
 Fields:
 
-- `kind` (string)
+- `base_url` (string)
   - REQUIRED for dispatch.
-  - Current supported value: `linear`
-- `endpoint` (string)
-  - Default for `tracker.kind == "linear"`: `https://api.linear.app/graphql`
-- `api_key` (string)
+  - Example: `https://gitlab.com` or `https://gitlab.example.com`.
+  - MUST NOT include a trailing slash after normalization.
+- `api_token` (string)
+  - REQUIRED for dispatch.
   - MAY be a literal token or `$VAR_NAME`.
-  - Canonical environment variable for `tracker.kind == "linear"`: `LINEAR_API_KEY`.
-  - If `$VAR_NAME` resolves to an empty string, treat the key as missing.
-- `project_slug` (string)
-  - REQUIRED for dispatch when `tracker.kind == "linear"`.
-- `active_states` (list of strings)
-  - Default: `Todo`, `In Progress`
-- `terminal_states` (list of strings)
-  - Default: `Closed`, `Cancelled`, `Canceled`, `Duplicate`, `Done`
+  - Canonical environment variable: `GITLAB_API_TOKEN`.
+  - If `$VAR_NAME` resolves to an empty string, treat the token as missing.
+- `project` (string or integer)
+  - REQUIRED for dispatch.
+  - Project path, for example `group/subgroup/project`, or numeric project ID.
+- `api_version` (string)
+  - Default: `v4`.
+  - Core conformance requires GitLab REST API v4 semantics.
+- `clone_protocol` (string)
+  - Allowed values: `ssh`, `https`.
+  - Default: `ssh`.
+- `clone_depth` (integer or null)
+  - Default: `1`.
+  - If `null` or `0`, perform a full clone/fetch.
+- `allow_insecure_tls` (boolean)
+  - Default: `false`.
+  - If `true`, implementation MUST document the risk and ensure secret values are not logged.
+
+Nested `issue` object:
+
+- `active_labels` (list of strings)
+  - REQUIRED for dispatch unless `allow_unlabeled_open_issues` is true.
+  - Default: `["symphony:ready"]`.
+- `allow_unlabeled_open_issues` (boolean)
+  - Default: `false`.
+  - If true, every open issue that passes other filters is eligible.
+- `running_label` (string)
+  - Default: `symphony:running`.
+- `review_label` (string)
+  - Default: `symphony:review`.
+- `error_label` (string)
+  - Default: `symphony:error`.
+- `terminal_labels` (list of strings)
+  - Default: `["symphony:done", "symphony:cancelled"]`.
+- `closed_is_terminal` (boolean)
+  - Default: `true`.
+- `blocked_link_types` (list of strings)
+  - Default: `["is_blocked_by"]`.
+  - Implementations MAY also inspect inverse `blocks` links when GitLab returns the relation from
+    the opposite direction.
+- `priority_labels` (map `label -> integer`)
+  - Default: `{}`.
+  - Lower integer values dispatch first.
+- `claim_ttl_ms` (integer)
+  - Default: `3600000` (1 hour).
+  - A stale `running_label` MAY be reclaimed when no local run is active and the last Symphony note
+    or issue update is older than this value.
+- `post_lifecycle_notes` (boolean)
+  - Default: `true`.
+  - If true, dispatch, error, retry exhaustion, and merge-request handoff events write issue notes.
+
+Nested `repository` object:
+
+- `base_branch` (string or null)
+  - Default: GitLab project `default_branch`.
+- `branch_template` (string)
+  - Default: `symphony/{{ issue.iid }}-{{ issue.slug }}`.
+- `worktree_subdir` (string)
+  - Default: `repo`.
+  - Repository checkout path relative to the issue workspace.
+- `require_origin_match` (boolean)
+  - Default: `true`.
+  - If true, the checked-out repository remote MUST match the normalized GitLab project clone URL.
+- `push_work_branch` (boolean)
+  - Default: `true`.
+  - If true, the work branch is pushed after agent success when commits or branch changes exist.
+- `reuse_existing_branch` (boolean)
+  - Default: `true`.
+  - If true, existing remote work branches are fetched and reused.
+
+Nested `merge_request` object:
+
+- `create` (boolean)
+  - Default: `true`.
+- `draft` (boolean)
+  - Default: `true`.
+- `title_template` (string)
+  - Default: `Resolve #{{ issue.iid }}: {{ issue.title }}`.
+- `description_template` (string)
+  - Default: implementation-defined, but SHOULD include the issue URL and a short generated run
+    summary when available.
+- `target_branch` (string or null)
+  - Default: `gitlab.repository.base_branch`.
+- `remove_source_branch` (boolean)
+  - Default: `true`.
+- `squash` (boolean or null)
+  - Default: `null`, meaning GitLab project default.
+- `labels` (list of strings)
+  - Default: `[]`.
+- `assign_to_issue_assignees` (boolean)
+  - Default: `false`.
 
 #### 5.3.2 `polling` (object)
 
 Fields:
 
 - `interval_ms` (integer)
-  - Default: `30000`
+  - Default: `30000`.
   - Changes SHOULD be re-applied at runtime and affect future tick scheduling without restart.
 
 #### 5.3.3 `workspace` (object)
@@ -376,18 +547,25 @@ Fields:
 Fields:
 
 - `root` (path string or `$VAR`)
-  - Default: `<system-temp>/symphony_workspaces`
+  - Default: `<system-temp>/symphony_gitlab_workspaces`.
   - `~` is expanded.
   - Relative paths are resolved relative to the directory containing `WORKFLOW.md`.
   - The effective workspace root is normalized to an absolute path before use.
+- `cleanup_terminal_workspaces` (boolean)
+  - Default: `true`.
+- `preserve_failed_workspaces` (boolean)
+  - Default: `true`.
 
 #### 5.3.4 `hooks` (object)
 
 Fields:
 
 - `after_create` (multiline shell script string, OPTIONAL)
-  - Runs only when a workspace directory is newly created.
+  - Runs only when an issue workspace directory is newly created.
   - Failure aborts workspace creation.
+- `after_clone` (multiline shell script string, OPTIONAL)
+  - Runs after the GitLab repository is cloned for the first time.
+  - Failure aborts workspace preparation.
 - `before_run` (multiline shell script string, OPTIONAL)
   - Runs before each agent attempt after workspace preparation and before launching the coding
     agent.
@@ -400,29 +578,26 @@ Fields:
   - Runs before workspace deletion if the directory exists.
   - Failure is logged but ignored; cleanup still proceeds.
 - `timeout_ms` (integer, OPTIONAL)
-  - Default: `60000`
+  - Default: `60000`.
   - Applies to all workspace hooks.
   - Invalid values fail configuration validation.
-  - Changes SHOULD be re-applied at runtime for future hook executions.
 
 #### 5.3.5 `agent` (object)
 
 Fields:
 
 - `max_concurrent_agents` (integer)
-  - Default: `10`
+  - Default: `10`.
   - Changes SHOULD be re-applied at runtime and affect subsequent dispatch decisions.
 - `max_turns` (positive integer)
-  - Default: `20`
+  - Default: `20`.
   - Limits the number of coding-agent turns within one worker session.
-  - Invalid values fail configuration validation.
 - `max_retry_backoff_ms` (integer)
-  - Default: `300000` (5 minutes)
-  - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
-- `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
+  - Default: `300000` (5 minutes).
+- `max_concurrent_agents_by_label` (map `label -> positive integer`)
   - Default: empty map.
-  - State keys are normalized (`lowercase`) for lookup.
-  - Invalid entries (non-positive or non-numeric) are ignored.
+  - Label keys are normalized for lookup.
+  - Invalid entries are ignored and logged.
 
 #### 5.3.6 `codex` (object)
 
@@ -431,14 +606,11 @@ Fields:
 For Codex-owned config values such as `approval_policy`, `thread_sandbox`, and
 `turn_sandbox_policy`, supported values are defined by the targeted Codex app-server version.
 Implementors SHOULD treat them as pass-through Codex config values rather than relying on a
-hand-maintained enum in this spec. To inspect the installed Codex schema, run
-`codex app-server generate-json-schema --out <dir>` and inspect the relevant definitions referenced
-by `v2/ThreadStartParams.json` and `v2/TurnStartParams.json`. Implementations MAY validate these
-fields locally if they want stricter startup checks.
+hand-maintained enum in this spec.
 
 - `command` (string shell command)
-  - Default: `codex app-server`
-  - The runtime launches this command via `bash -lc` in the workspace directory.
+  - Default: `codex app-server`.
+  - The runtime launches this command via `bash -lc` in the repository path.
   - The launched process MUST speak a compatible app-server protocol over stdio.
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
@@ -447,12 +619,25 @@ fields locally if they want stricter startup checks.
 - `turn_sandbox_policy` (Codex `SandboxPolicy` value)
   - Default: implementation-defined.
 - `turn_timeout_ms` (integer)
-  - Default: `3600000` (1 hour)
+  - Default: `3600000` (1 hour).
 - `read_timeout_ms` (integer)
-  - Default: `5000`
+  - Default: `5000`.
 - `stall_timeout_ms` (integer)
-  - Default: `300000` (5 minutes)
+  - Default: `300000` (5 minutes).
   - If `<= 0`, stall detection is disabled.
+
+#### 5.3.7 `observability` (object)
+
+Fields:
+
+- `log_gitlab_api_errors` (boolean)
+  - Default: `true`.
+- `redact_gitlab_token` (boolean)
+  - Default: `true`.
+- `emit_issue_notes` (boolean)
+  - Default: inherits `gitlab.issue.post_lifecycle_notes`.
+- `status_snapshot` (boolean)
+  - Default: `true`.
 
 ### 5.4 Prompt Template Contract
 
@@ -460,22 +645,27 @@ The Markdown body of `WORKFLOW.md` is the per-issue prompt template.
 
 Rendering requirements:
 
-- Use a strict template engine (Liquid-compatible semantics are sufficient).
+- Use a strict template engine. Liquid-compatible semantics are sufficient.
 - Unknown variables MUST fail rendering.
 - Unknown filters MUST fail rendering.
 
 Template input variables:
 
-- `issue` (object)
-  - Includes all normalized issue fields, including labels and blockers.
-- `attempt` (integer or null)
-  - `null`/absent on first attempt.
-  - Integer on retry or continuation run.
+- `issue`
+  - Includes all normalized issue fields, including labels, blockers, branch name, and merge request.
+- `project`
+  - Includes normalized GitLab project fields.
+- `repository`
+  - Includes `base_branch`, `work_branch`, `remote_url`, and `repository_path`.
+- `merge_request`
+  - Existing or planned merge request summary, or null before handoff.
+- `attempt`
+  - `null` or absent on first attempt; integer on retry or continuation run.
 
 Fallback prompt behavior:
 
-- If the workflow prompt body is empty, the runtime MAY use a minimal default prompt
-  (`You are working on an issue from Linear.`).
+- If the workflow prompt body is empty, the runtime MAY use a minimal default prompt:
+  `You are working on a GitLab issue. Make the requested code changes, validate them, push the work branch, and prepare a merge request.`
 - Workflow file read/parse failures are configuration/validation errors and SHOULD NOT silently fall
   back to a prompt.
 
@@ -486,8 +676,8 @@ Error classes:
 - `missing_workflow_file`
 - `workflow_parse_error`
 - `workflow_front_matter_not_a_map`
-- `template_parse_error` (during prompt rendering)
-- `template_render_error` (unknown variable/filter, invalid interpolation)
+- `template_parse_error`
+- `template_render_error`
 
 Dispatch gating behavior:
 
@@ -500,24 +690,26 @@ Dispatch gating behavior:
 
 Configuration is resolved in this order:
 
-1. Select the workflow file path (explicit runtime setting, otherwise cwd default).
+1. Select the workflow file path, explicit runtime setting first, otherwise cwd default.
 2. Parse YAML front matter into a raw config map.
 3. Apply built-in defaults for missing OPTIONAL fields.
 4. Resolve `$VAR_NAME` indirection only for config values that explicitly contain `$VAR_NAME`.
-5. Coerce and validate typed values.
+5. Fetch GitLab project metadata needed to complete defaults, such as `default_branch`.
+6. Coerce and validate typed values.
 
 Environment variables do not globally override YAML values. They are used only when a config value
 explicitly references them.
 
 Value coercion semantics:
 
-- Path/command fields support:
-  - `~` home expansion
-  - `$VAR` expansion for env-backed path values
-  - Apply expansion only to values intended to be local filesystem paths; do not rewrite URIs or
-    arbitrary shell command strings.
+- Path fields support `~` and `$VAR` expansion.
+- Apply path expansion only to values intended to be local filesystem paths; do not rewrite URIs or
+  arbitrary shell command strings.
 - Relative `workspace.root` values resolve relative to the directory containing the selected
   `WORKFLOW.md`.
+- GitLab `base_url` is normalized by trimming one trailing slash.
+- Label comparisons use normalized lowercase values; writes SHOULD preserve configured label
+  spelling.
 
 ### 6.2 Dynamic Reload Semantics
 
@@ -525,25 +717,16 @@ Dynamic reload is REQUIRED:
 
 - The software MUST detect `WORKFLOW.md` changes.
 - On change, it MUST re-read and re-apply workflow config and prompt template without restart.
-- The software MUST attempt to adjust live behavior to the new config (for example polling
-  cadence, concurrency limits, active/terminal states, codex settings, workspace paths/hooks, and
-  prompt content for future runs).
 - Reloaded config applies to future dispatch, retry scheduling, reconciliation decisions, hook
-  execution, and agent launches.
+  execution, GitLab API calls, workspace preparation, merge-request behavior, and agent launches.
 - Implementations are not REQUIRED to restart in-flight agent sessions automatically when config
   changes.
-- Extensions that manage their own listeners/resources (for example an HTTP server port change) MAY
-  require restart unless the implementation explicitly supports live rebind.
-- Implementations SHOULD also re-validate/reload defensively during runtime operations (for example
-  before dispatch) in case filesystem watch events are missed.
 - Invalid reloads MUST NOT crash the service; keep operating with the last known good effective
   configuration and emit an operator-visible error.
+- If the configured GitLab project changes, in-flight runs MAY continue against their original
+  project and future dispatch MUST use the new project after validation succeeds.
 
 ### 6.3 Dispatch Preflight Validation
-
-This validation is a scheduler preflight run before attempting to dispatch new work. It validates
-the workflow/config needed to poll and launch workers, not a full audit of all possible workflow
-behavior.
 
 Startup validation:
 
@@ -553,44 +736,49 @@ Startup validation:
 Per-tick dispatch validation:
 
 - Re-validate before each dispatch cycle.
-- If validation fails, skip dispatch for that tick, keep reconciliation active, and emit an
-  operator-visible error.
+- If validation fails, skip dispatch for that tick, keep reconciliation active for known running
+  issues where possible, and emit an operator-visible error.
 
 Validation checks:
 
 - Workflow file can be loaded and parsed.
-- `tracker.kind` is present and supported.
-- `tracker.api_key` is present after `$` resolution.
-- `tracker.project_slug` is present when REQUIRED by the selected tracker kind.
+- `gitlab.base_url` is present and valid.
+- `gitlab.api_token` is present after `$` resolution.
+- `gitlab.project` is present.
+- GitLab project metadata can be fetched.
+- At least one project clone URL is available for the selected `clone_protocol`.
+- `gitlab.issue.active_labels` is non-empty unless `allow_unlabeled_open_issues` is true.
 - `codex.command` is present and non-empty.
+- `workspace.root` can be resolved to an absolute path.
 
-### 6.4 Core Config Fields Summary (Cheat Sheet)
+### 6.4 Core Config Fields Summary
 
-This section is intentionally redundant so a coding agent can implement the config layer quickly.
-Extension fields are documented in the extension section that defines them. Core conformance does
-not require recognizing or validating extension fields unless that extension is implemented.
-
-- `tracker.kind`: string, REQUIRED, currently `linear`
-- `tracker.endpoint`: string, default `https://api.linear.app/graphql` when `tracker.kind=linear`
-- `tracker.api_key`: string or `$VAR`, canonical env `LINEAR_API_KEY` when `tracker.kind=linear`
-- `tracker.project_slug`: string, REQUIRED when `tracker.kind=linear`
-- `tracker.active_states`: list of strings, default `["Todo", "In Progress"]`
-- `tracker.terminal_states`: list of strings, default `["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]`
+- `gitlab.base_url`: string, REQUIRED
+- `gitlab.api_token`: string or `$VAR`, REQUIRED, canonical env `GITLAB_API_TOKEN`
+- `gitlab.project`: project path or ID, REQUIRED
+- `gitlab.clone_protocol`: `ssh` or `https`, default `ssh`
+- `gitlab.clone_depth`: integer or null, default `1`
+- `gitlab.issue.active_labels`: list, default `["symphony:ready"]`
+- `gitlab.issue.running_label`: string, default `symphony:running`
+- `gitlab.issue.review_label`: string, default `symphony:review`
+- `gitlab.issue.error_label`: string, default `symphony:error`
+- `gitlab.issue.terminal_labels`: list, default `["symphony:done", "symphony:cancelled"]`
+- `gitlab.issue.closed_is_terminal`: boolean, default `true`
+- `gitlab.issue.claim_ttl_ms`: integer, default `3600000`
+- `gitlab.repository.base_branch`: string or null, default project `default_branch`
+- `gitlab.repository.branch_template`: string, default `symphony/{{ issue.iid }}-{{ issue.slug }}`
+- `gitlab.repository.worktree_subdir`: string, default `repo`
+- `gitlab.repository.require_origin_match`: boolean, default `true`
+- `gitlab.merge_request.create`: boolean, default `true`
+- `gitlab.merge_request.draft`: boolean, default `true`
+- `gitlab.merge_request.target_branch`: string or null, default repository base branch
 - `polling.interval_ms`: integer, default `30000`
-- `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_workspaces`
-- `hooks.after_create`: shell script or null
-- `hooks.before_run`: shell script or null
-- `hooks.after_run`: shell script or null
-- `hooks.before_remove`: shell script or null
+- `workspace.root`: path resolved to absolute, default `<system-temp>/symphony_gitlab_workspaces`
 - `hooks.timeout_ms`: integer, default `60000`
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
-- `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
-- `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
+- `agent.max_retry_backoff_ms`: integer, default `300000`
 - `codex.command`: shell command string, default `codex app-server`
-- `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
-- `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
-- `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
@@ -600,1092 +788,377 @@ not require recognizing or validating extension fields unless that extension is 
 The orchestrator is the only component that mutates scheduling state. All worker outcomes are
 reported back to it and converted into explicit state transitions.
 
-### 7.1 Issue Orchestration States
+### 7.1 Internal Issue Orchestration States
 
-This is not the same as tracker states (`Todo`, `In Progress`, etc.). This is the service's internal
-claim state.
+This is not the same as GitLab issue state.
 
 1. `Unclaimed`
    - Issue is not running and has no retry scheduled.
 
 2. `Claimed`
-   - Orchestrator has reserved the issue to prevent duplicate dispatch.
-   - In practice, claimed issues are either `Running` or `RetryQueued`.
+   - Orchestrator has reserved the issue locally and, when configured, has applied the GitLab
+     `running_label`.
 
 3. `Running`
-   - Worker task exists and the issue is tracked in `running` map.
+   - Worker exists and a coding-agent session may be active.
 
 4. `RetryQueued`
-   - Worker is not running, but a retry timer exists in `retry_attempts`.
+   - No worker is running, but a retry timer is scheduled. The issue remains locally claimed until
+     retry succeeds, the issue becomes ineligible, or retry is abandoned.
 
 5. `Released`
-   - Claim removed because issue is terminal, non-active, missing, or retry path completed without
-     re-dispatch.
+   - Local claim was removed. The issue may be redispatched later if it remains eligible.
 
-Important nuance:
+6. `Terminal`
+   - GitLab issue is closed or has a configured terminal label.
 
-- A successful worker exit does not mean the issue is done forever.
-- The worker MAY continue through multiple back-to-back coding-agent turns before it exits.
-- After each normal turn completion, the worker re-checks the tracker issue state.
-- If the issue is still in an active state, the worker SHOULD start another turn on the same live
-  coding-agent thread in the same workspace, up to `agent.max_turns`.
-- The first turn SHOULD use the full rendered task prompt.
-- Continuation turns SHOULD send only continuation guidance to the existing thread, not resend the
-  original task prompt that is already present in thread history.
-- Once the worker exits normally, the orchestrator still schedules a short continuation retry
-  (about 1 second) so it can re-check whether the issue remains active and needs another worker
-  session.
+### 7.2 GitLab Label Lifecycle
 
-### 7.2 Run Attempt Lifecycle
+Default label transitions:
 
-A run attempt transitions through these phases:
+- Candidate issue:
+  - `state=opened`
+  - has `active_labels`, unless unlabeled dispatch is enabled
+  - lacks `running_label`
+  - lacks `terminal_labels`
+  - not blocked by an open blocker
 
-1. `PreparingWorkspace`
-2. `BuildingPrompt`
-3. `LaunchingAgentProcess`
-4. `InitializingSession`
-5. `StreamingTurn`
-6. `Finishing`
-7. `Succeeded`
-8. `Failed`
-9. `TimedOut`
-10. `Stalled`
-11. `CanceledByReconciliation`
+- Dispatch claim:
+  - add `running_label`
+  - remove `error_label` if present
+  - optionally write lifecycle note
 
-Distinct terminal reasons are important because retry logic and logs differ.
+- Normal agent success:
+  - push work branch if configured and changed
+  - create or update merge request if configured
+  - remove `running_label`
+  - add `review_label`
+  - optionally remove active labels if configured by implementation policy
+  - write lifecycle note with merge request URL
 
-### 7.3 Transition Triggers
+- Agent failure:
+  - remove `running_label` when the run is no longer active
+  - add `error_label`
+  - schedule retry when retry policy allows
+  - write lifecycle note with redacted error summary
 
-- `Poll Tick`
-  - Reconcile active runs.
-  - Validate config.
-  - Fetch candidate issues.
-  - Dispatch until slots are exhausted.
+- Terminal issue:
+  - stop active run
+  - remove local claim
+  - clean workspace if `workspace.cleanup_terminal_workspaces` is true
 
-- `Worker Exit (normal)`
-  - Remove running entry.
-  - Update aggregate runtime totals.
-  - Schedule continuation retry (attempt `1`) after the worker exhausts or finishes its in-process
-    turn loop.
+### 7.3 Dispatch Eligibility
 
-- `Worker Exit (abnormal)`
-  - Remove running entry.
-  - Update aggregate runtime totals.
-  - Schedule exponential-backoff retry.
+An issue SHOULD dispatch only if all are true:
 
-- `Codex Update Event`
-  - Update live session fields, token counters, and rate limits.
+- The issue belongs to the configured GitLab project.
+- `issue.state == opened`.
+- It matches configured active label policy.
+- It does not have `running_label`, unless stale claim recovery applies.
+- It does not have any configured terminal label.
+- It has no blockers that are still open or non-terminal.
+- It is not already in `running` or `retry_attempts`.
+- Dispatching it will not exceed global or label-specific concurrency limits.
 
-- `Retry Timer Fired`
-  - Re-fetch active candidates and attempt re-dispatch, or release claim if no longer eligible.
+### 7.4 Dispatch Sort Order
 
-- `Reconciliation State Refresh`
-  - Stop runs whose issue states are terminal or no longer active.
+Candidate issues SHOULD be sorted by:
 
-- `Stall Timeout`
-  - Kill worker and schedule retry.
+1. configured priority label or weight, lower first
+2. oldest `created_at`
+3. lowest `iid`
 
-### 7.4 Idempotency and Recovery Rules
+## 8. GitLab Integration Specification
 
-- The orchestrator serializes state mutations through one authority to avoid duplicate dispatch.
-- `claimed` and `running` checks are REQUIRED before launching any worker.
-- Reconciliation runs before dispatch on every tick.
-- Restart recovery is tracker-driven and filesystem-driven (without a durable orchestrator DB).
-- Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+### 8.1 Authentication
 
-## 8. Polling, Scheduling, and Reconciliation
+- API requests MUST use the configured `gitlab.api_token`.
+- Implementations SHOULD send the token as `PRIVATE-TOKEN` or `Authorization: Bearer` according to
+  their GitLab token type.
+- Tokens MUST NOT be logged.
+- Validation MAY check token presence and project access, but MUST NOT print token values.
 
-### 8.1 Poll Loop
+### 8.2 Project Discovery
 
-At startup, the service validates config, performs startup cleanup, schedules an immediate tick, and
-then repeats every `polling.interval_ms`.
+At startup and on successful config reload, the implementation MUST fetch the configured GitLab
+project.
 
-The effective poll interval SHOULD be updated when workflow config changes are re-applied.
+The normalized project MUST include:
 
-Tick sequence:
+- project ID
+- path with namespace
+- default branch
+- selected clone URL
 
-1. Reconcile running issues.
-2. Run dispatch preflight validation.
-3. Fetch candidate issues from tracker using active states.
-4. Sort issues by dispatch priority.
-5. Dispatch eligible issues while slots remain.
-6. Notify observability/status consumers of state changes.
+If `clone_protocol=ssh`, use `ssh_url_to_repo`.
+If `clone_protocol=https`, use `http_url_to_repo`.
 
-If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
-first.
+### 8.3 Issue Fetching
 
-### 8.2 Candidate Selection Rules
+Candidate issue fetch MUST:
 
-An issue is dispatch-eligible only if all are true:
+- query only the configured project
+- request `state=opened`
+- apply active label filtering either server-side or client-side
+- paginate until no more pages are available or an implementation-defined page cap is reached
+- normalize labels to lowercase for scheduler comparisons
 
-- It has `id`, `identifier`, `title`, and `state`.
-- Its state is in `active_states` and not in `terminal_states`.
-- It is not already in `running`.
-- It is not already in `claimed`.
-- Global concurrency slots are available.
-- Per-state concurrency slots are available.
-- Blocker rule for `Todo` state passes:
-  - If the issue state is `Todo`, do not dispatch when any blocker is non-terminal.
+State refresh MUST support fetching specific issues by IID or ID.
 
-Sorting order (stable intent):
+### 8.4 Issue Blockers
 
-1. `priority` ascending (1..4 are preferred; null/unknown sorts last)
-2. `created_at` oldest first
-3. `identifier` lexicographic tie-breaker
+Implementations MUST inspect GitLab issue links when `blocked_link_types` is non-empty.
 
-### 8.3 Concurrency Control
+An issue is blocked if:
 
-Global limit:
+- it has a linked issue whose relation means the candidate is blocked by that linked issue; and
+- the linked issue is not closed and lacks terminal labels when terminal labels can be fetched.
 
-- `available_slots = max(max_concurrent_agents - running_count, 0)`
+If blocker details cannot be fetched due to a transient GitLab error, the candidate SHOULD be
+treated as not eligible for that tick and the error SHOULD be logged.
 
-Per-state limit:
+### 8.5 Issue Notes and Labels
 
-- `max_concurrent_agents_by_state[state]` if present (state key normalized)
-- otherwise fallback to global limit
+The GitLab client MUST provide narrow operations for:
 
-The runtime counts issues by their current tracked state in the `running` map.
+- adding labels
+- removing labels
+- replacing labels when implementation policy requires an atomic state transition
+- adding issue notes
 
-### 8.4 Retry and Backoff
+Lifecycle notes SHOULD be concise and SHOULD include:
 
-Retry entry creation:
+- run start
+- retry scheduling after failure
+- final failure after retry exhaustion
+- merge request handoff
 
-- Cancel any existing retry timer for the same issue.
-- Store `attempt`, `identifier`, `error`, `due_at_ms`, and new timer handle.
+Lifecycle notes MUST NOT include secrets, full environment dumps, raw tokens, or unredacted command
+lines that contain credentials.
 
-Backoff formula:
+### 8.6 Repository Operations
 
-- Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
-- Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
-- Power is capped by the configured max retry backoff (default `300000` / 5m).
+The workspace manager MUST use the GitLab project clone URL selected from project metadata.
 
-Retry handling behavior:
+Repository preparation:
 
-1. Fetch active candidate issues (not all issues).
-2. Find the specific issue by `issue_id`.
-3. If not found, release claim.
-4. If found and still candidate-eligible:
-   - Dispatch if slots are available.
-   - Otherwise requeue with error `no available orchestrator slots`.
-5. If found but no longer active, release claim.
+1. Ensure the issue workspace exists.
+2. Clone the repository into `gitlab.repository.worktree_subdir` if missing.
+3. If repository already exists, verify it is a Git repository.
+4. If `require_origin_match` is true, verify `origin` matches the configured GitLab project clone
+   URL after normalization.
+5. Fetch the base branch and work branch.
+6. Check out the work branch if it exists and reuse is enabled; otherwise create it from base branch.
+7. Record `commit_sha_before_run`.
 
-Note:
+If origin verification fails, the run MUST fail before launching the agent.
 
-- Terminal-state workspace cleanup is handled by startup cleanup and active-run reconciliation
-  (including terminal transitions for currently running issues).
-- Retry handling mainly operates on active candidates and releases claims when the issue is absent,
-  rather than performing terminal cleanup itself.
+### 8.7 Branch Push
 
-### 8.5 Active Run Reconciliation
+After agent success, if `push_work_branch` is true:
 
-Reconciliation runs every tick and has two parts.
+- detect whether the work branch has commits or changes to push
+- push the work branch to the configured GitLab project remote
+- fail the run if push fails
 
-Part A: Stall detection
+If the agent leaves uncommitted changes and the workflow requires committed output, the run SHOULD
+fail with a clear error. If the workflow explicitly allows uncommitted handoff, the implementation
+MUST document how those changes are preserved.
 
-- For each running issue, compute `elapsed_ms` since:
-  - `last_codex_timestamp` if any event has been seen, else
-  - `started_at`
-- If `elapsed_ms > codex.stall_timeout_ms`, terminate the worker and queue a retry.
-- If `stall_timeout_ms <= 0`, skip stall detection entirely.
+### 8.8 Merge Request Handoff
 
-Part B: Tracker state refresh
+If `gitlab.merge_request.create` is true, normal agent success MUST create or update a merge request
+unless no branch changes exist and the implementation documents that no-op runs skip merge-request
+creation.
 
-- Fetch current issue states for all running issue IDs.
-- For each running issue:
-  - If tracker state is terminal: terminate worker and clean workspace.
-  - If tracker state is still active: update the in-memory issue snapshot.
-  - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
-- If state refresh fails, keep workers running and try again on the next tick.
+Merge request lookup SHOULD search for an open merge request with:
 
-### 8.6 Startup Terminal Workspace Cleanup
+- source branch equal to the work branch
+- target branch equal to configured target branch
+- project equal to configured project
 
-When the service starts:
+If none exists, create one with configured title, description, draft flag, labels, squash, source
+branch removal, assignee policy, source branch, and target branch.
 
-1. Query tracker for issues in terminal states.
-2. For each returned issue identifier, remove the corresponding workspace directory.
-3. If the terminal-issues fetch fails, log a warning and continue startup.
+After merge-request handoff:
 
-This prevents stale terminal workspaces from accumulating after restarts.
+- issue `running_label` MUST be removed
+- issue `review_label` SHOULD be added
+- lifecycle note SHOULD include the merge request URL
 
-## 9. Workspace Management and Safety
+### 8.9 Error Mapping
 
-### 9.1 Workspace Layout
+GitLab client errors SHOULD be mapped to stable classes:
 
-Workspace root:
+- `gitlab_auth_error`
+- `gitlab_permission_error`
+- `gitlab_not_found`
+- `gitlab_rate_limited`
+- `gitlab_validation_error`
+- `gitlab_conflict`
+- `gitlab_server_error`
+- `gitlab_network_error`
+- `gitlab_malformed_response`
 
-- `workspace.root` (normalized absolute path)
+Transient errors SHOULD be retried according to retry policy. Permanent errors SHOULD fail startup
+or fail the affected run with an operator-visible message.
 
-Per-issue workspace path:
-
-- `<workspace.root>/<sanitized_issue_identifier>`
-
-Workspace persistence:
-
-- Workspaces are reused across runs for the same issue.
-- Successful runs do not auto-delete workspaces.
-
-### 9.2 Workspace Creation and Reuse
-
-Input: `issue.identifier`
-
-Algorithm summary:
-
-1. Sanitize identifier to `workspace_key`.
-2. Compute workspace path under workspace root.
-3. Ensure the workspace path exists as a directory.
-4. Mark `created_now=true` only if the directory was created during this call; otherwise
-   `created_now=false`.
-5. If `created_now=true`, run `after_create` hook if configured.
-
-Notes:
-
-- This section does not assume any specific repository/VCS workflow.
-- Workspace preparation beyond directory creation (for example dependency bootstrap, checkout/sync,
-  code generation) is implementation-defined and is typically handled via hooks.
-
-### 9.3 OPTIONAL Workspace Population (Implementation-Defined)
-
-The spec does not require any built-in VCS or repository bootstrap behavior.
-
-Implementations MAY populate or synchronize the workspace using implementation-defined logic and/or
-hooks (for example `after_create` and/or `before_run`).
-
-Failure handling:
-
-- Workspace population/synchronization failures return an error for the current attempt.
-- If failure happens while creating a brand-new workspace, implementations MAY remove the partially
-  prepared directory.
-- Reused workspaces SHOULD NOT be destructively reset on population failure unless that policy is
-  explicitly chosen and documented.
-
-### 9.4 Workspace Hooks
-
-Supported hooks:
-
-- `hooks.after_create`
-- `hooks.before_run`
-- `hooks.after_run`
-- `hooks.before_remove`
-
-Execution contract:
-
-- Execute in a local shell context appropriate to the host OS, with the workspace directory as
-  `cwd`.
-- On POSIX systems, `sh -lc <script>` (or a stricter equivalent such as `bash -lc <script>`) is a
-  conforming default.
-- Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
-- Log hook start, failures, and timeouts.
-
-Failure semantics:
-
-- `after_create` failure or timeout is fatal to workspace creation.
-- `before_run` failure or timeout is fatal to the current run attempt.
-- `after_run` failure or timeout is logged and ignored.
-- `before_remove` failure or timeout is logged and ignored.
-
-### 9.5 Safety Invariants
-
-This is the most important portability constraint.
-
-Invariant 1: Run the coding agent only in the per-issue workspace path.
-
-- Before launching the coding-agent subprocess, validate:
-  - `cwd == workspace_path`
-
-Invariant 2: Workspace path MUST stay inside workspace root.
-
-- Normalize both paths to absolute.
-- Require `workspace_path` to have `workspace_root` as a prefix directory.
-- Reject any path outside the workspace root.
-
-Invariant 3: Workspace key is sanitized.
-
-- Only `[A-Za-z0-9._-]` allowed in workspace directory names.
-- Replace all other characters with `_`.
-
-## 10. Agent Runner Protocol (Coding Agent Integration)
-
-This section defines Symphony's language-neutral responsibilities when integrating a Codex
-app-server. The Codex app-server protocol for the targeted Codex version is the source of truth for
-protocol schemas, message payloads, transport framing, and method names.
-
-Protocol source of truth:
-
-- Implementations MUST send messages that are valid for the targeted Codex app-server version.
-- Implementations MUST consult the targeted Codex app-server documentation or generated schema
-  instead of treating this specification as a protocol schema.
-- If this specification appears to conflict with the targeted Codex app-server protocol, the Codex
-  protocol controls protocol shape and transport behavior.
-- Symphony-specific requirements in this section still control orchestration behavior, workspace
-  selection, prompt construction, continuation handling, and observability extraction.
-
-### 10.1 Launch Contract
-
-Subprocess launch parameters:
-
-- Command: `codex.command`
-- Invocation: `bash -lc <codex.command>`
-- Working directory: workspace path
-- Transport/framing: the protocol transport required by the targeted Codex app-server version
-
-Notes:
-
-- The default command is `codex app-server`.
-- Approval policy, sandbox policy, cwd, prompt input, and OPTIONAL tool declarations are supplied
-  using fields supported by the targeted Codex app-server version.
-
-RECOMMENDED additional process settings:
-
-- Max line size: 10 MB (for safe buffering)
-
-### 10.2 Session Startup Responsibilities
-
-Reference: https://developers.openai.com/codex/app-server/
-
-Startup MUST follow the targeted Codex app-server contract. Symphony additionally requires the
-client to:
-
-- Start the app-server subprocess in the per-issue workspace.
-- Initialize the app-server session using the targeted Codex app-server protocol.
-- Create or resume a coding-agent thread according to the targeted protocol.
-- Supply the absolute per-issue workspace path as the thread/turn working directory wherever the
-  targeted protocol accepts cwd.
-- Start the first turn with the rendered issue prompt.
-- Start later in-worker continuation turns on the same live thread with continuation guidance rather
-  than resending the original issue prompt.
-- Supply the implementation's documented approval and sandbox policy using fields supported by the
-  targeted protocol.
-- Include issue-identifying metadata, such as `<issue.identifier>: <issue.title>`, when the targeted
-  protocol supports turn or session titles.
-- Advertise implemented client-side tools using the targeted protocol.
-
-Session identifiers:
-
-- Extract `thread_id` from the thread identity returned by the targeted Codex app-server protocol.
-- Extract `turn_id` from each turn identity returned by the targeted Codex app-server protocol.
-- Emit `session_id = "<thread_id>-<turn_id>"`
-- Reuse the same `thread_id` for all continuation turns inside one worker run
-
-### 10.3 Streaming Turn Processing
-
-The client processes app-server updates according to the targeted Codex app-server protocol until
-the active turn terminates.
-
-Completion conditions:
-
-- Targeted-protocol turn completion signal -> success
-- Targeted-protocol turn failure signal -> failure
-- Targeted-protocol turn cancellation signal -> failure
-- turn timeout (`turn_timeout_ms`) -> failure
-- subprocess exit -> failure
-
-Continuation processing:
-
-- If the worker decides to continue after a successful turn, it SHOULD start another turn on the same
-  live thread using the targeted protocol.
-- The app-server subprocess SHOULD remain alive across those continuation turns and be stopped only
-  when the worker run is ending.
-
-Transport handling requirements:
-
-- Follow the transport and framing rules of the targeted Codex app-server version.
-- For stdio-based transports, keep protocol stream handling separate from diagnostic stderr
-  handling unless the targeted protocol specifies otherwise.
-
-### 10.4 Emitted Runtime Events (Upstream to Orchestrator)
-
-The app-server client emits structured events to the orchestrator callback. Each event SHOULD
-include:
-
-- `event` (enum/string)
-- `timestamp` (UTC timestamp)
-- `codex_app_server_pid` (if available)
-- OPTIONAL `usage` map (token counts)
-- payload fields as needed
-
-Important emitted events include, for example:
-
-- `session_started`
-- `startup_failed`
-- `turn_completed`
-- `turn_failed`
-- `turn_cancelled`
-- `turn_ended_with_error`
-- `turn_input_required`
-- `approval_auto_approved`
-- `unsupported_tool_call`
-- `notification`
-- `other_message`
-- `malformed`
-
-### 10.5 Approval, Tool Calls, and User Input Policy
-
-Approval, sandbox, and user-input behavior is implementation-defined.
-
-Policy requirements:
-
-- Each implementation MUST document its chosen approval, sandbox, and operator-confirmation
-  posture.
-- Approval requests and user-input-required events MUST NOT leave a run stalled indefinitely. An
-  implementation MAY either satisfy them, surface them to an operator, auto-resolve them, or
-  fail the run according to its documented policy.
-
-Example high-trust behavior:
-
-- Auto-approve command execution approvals for the session.
-- Auto-approve file-change approvals for the session.
-- Treat user-input-required turns as hard failure.
-
-Unsupported dynamic tool calls:
-
-- Supported dynamic tool calls that are explicitly implemented and advertised by the runtime SHOULD
-  be handled according to their extension contract.
-- If the agent requests a dynamic tool call that is not supported, return a tool failure response
-  using the targeted protocol and continue the session.
-- This prevents the session from stalling on unsupported tool execution paths.
-
-Optional client-side tool extension:
-
-- An implementation MAY expose a limited set of client-side tools to the app-server session.
-- Current standardized optional tool: `linear_graphql`.
-- If implemented, supported tools SHOULD be advertised to the app-server session during startup
-  using the protocol mechanism supported by the targeted Codex app-server version.
-- Unsupported tool names SHOULD still return a failure result using the targeted protocol and
-  continue the session.
-
-`linear_graphql` extension contract:
-
-- Purpose: execute a raw GraphQL query or mutation against Linear using Symphony's configured
-  tracker auth for the current session.
-- Availability: only meaningful when `tracker.kind == "linear"` and valid Linear auth is configured.
-- Preferred input shape:
-
-  ```json
-  {
-    "query": "single GraphQL query or mutation document",
-    "variables": {
-      "optional": "graphql variables object"
-    }
-  }
-  ```
-
-- `query` MUST be a non-empty string.
-- `query` MUST contain exactly one GraphQL operation.
-- `variables` is OPTIONAL and, when present, MUST be a JSON object.
-- Implementations MAY additionally accept a raw GraphQL query string as shorthand input.
-- Execute one GraphQL operation per tool call.
-- If the provided document contains multiple operations, reject the tool call as invalid input.
-- `operationName` selection is intentionally out of scope for this extension.
-- Reuse the configured Linear endpoint and auth from the active Symphony workflow/runtime config; do
-  not require the coding agent to read raw tokens from disk.
-- Tool result semantics:
-  - transport success + no top-level GraphQL `errors` -> `success=true`
-  - top-level GraphQL `errors` present -> `success=false`, but preserve the GraphQL response body
-    for debugging
-  - invalid input, missing auth, or transport failure -> `success=false` with an error payload
-- Return the GraphQL response or error payload as structured tool output that the model can inspect
-  in-session.
-
-User-input-required policy:
-
-- Implementations MUST document how targeted-protocol user-input-required signals are handled.
-- A run MUST NOT stall indefinitely waiting for user input.
-- A conforming implementation MAY fail the run, surface the request to an operator, satisfy it
-  through an approved operator channel, or auto-resolve it according to its documented policy.
-- The example high-trust behavior above fails user-input-required turns immediately.
-
-### 10.6 Timeouts and Error Mapping
-
-Timeouts:
-
-- `codex.read_timeout_ms`: request/response timeout during startup and sync requests
-- `codex.turn_timeout_ms`: total turn stream timeout
-- `codex.stall_timeout_ms`: enforced by orchestrator based on event inactivity
-
-Error mapping (RECOMMENDED normalized categories):
-
-- `codex_not_found`
-- `invalid_workspace_cwd`
-- `response_timeout`
-- `turn_timeout`
-- `port_exit`
-- `response_error`
-- `turn_failed`
-- `turn_cancelled`
-- `turn_input_required`
-
-### 10.7 Agent Runner Contract
-
-The `Agent Runner` wraps workspace + prompt + app-server client.
-
-Behavior:
-
-1. Create/reuse workspace for issue.
-2. Build prompt from workflow template.
-3. Start app-server session.
-4. Forward app-server events to orchestrator.
-5. On any error, fail the worker attempt (the orchestrator will retry).
-
-Note:
-
-- Workspaces are intentionally preserved after successful runs.
-
-## 11. Issue Tracker Integration Contract (Linear-Compatible)
-
-### 11.1 REQUIRED Operations
-
-An implementation MUST support these tracker adapter operations:
-
-1. `fetch_candidate_issues()`
-   - Return issues in configured active states for a configured project.
-
-2. `fetch_issues_by_states(state_names)`
-   - Used for startup terminal cleanup.
-
-3. `fetch_issue_states_by_ids(issue_ids)`
-   - Used for active-run reconciliation.
-
-### 11.2 Query Semantics (Linear)
-
-Linear-specific requirements for `tracker.kind == "linear"`:
-
-- `tracker.kind == "linear"`
-- GraphQL endpoint (default `https://api.linear.app/graphql`)
-- Auth token sent in `Authorization` header
-- `tracker.project_slug` maps to Linear project `slugId`
-- Candidate issue query filters project using `project: { slugId: { eq: $projectSlug } }`
-- Issue-state refresh query uses GraphQL issue IDs with variable type `[ID!]`
-- Pagination REQUIRED for candidate issues
-- Page size default: `50`
-- Network timeout: `30000 ms`
-
-Important:
-
-- Linear GraphQL schema details can drift. Keep query construction isolated and test the exact query
-  fields/types REQUIRED by this specification.
-
-A non-Linear implementation MAY change transport details, but the normalized outputs MUST match the
-domain model in Section 4.
-
-### 11.3 Normalization Rules
-
-Candidate issue normalization SHOULD produce fields listed in Section 4.1.1.
-
-Additional normalization details:
-
-- `labels` -> lowercase strings
-- `blocked_by` -> derived from inverse relations where relation type is `blocks`
-- `priority` -> integer only (non-integers become null)
-- `created_at` and `updated_at` -> parse ISO-8601 timestamps
-
-### 11.4 Error Handling Contract
-
-RECOMMENDED error categories:
-
-- `unsupported_tracker_kind`
-- `missing_tracker_api_key`
-- `missing_tracker_project_slug`
-- `linear_api_request` (transport failures)
-- `linear_api_status` (non-200 HTTP)
-- `linear_graphql_errors`
-- `linear_unknown_payload`
-- `linear_missing_end_cursor` (pagination integrity error)
-
-Orchestrator behavior on tracker errors:
-
-- Candidate fetch failure: log and skip dispatch for this tick.
-- Running-state refresh failure: log and keep active workers running.
-- Startup terminal cleanup failure: log warning and continue startup.
-
-### 11.5 Tracker Writes (Important Boundary)
-
-Symphony does not require first-class tracker write APIs in the orchestrator.
-
-- Ticket mutations (state transitions, comments, PR metadata) are typically handled by the coding
-  agent using tools defined by the workflow prompt.
-- The service remains a scheduler/runner and tracker reader.
-- Workflow-specific success often means "reached the next handoff state" (for example
-  `Human Review`) rather than tracker terminal state `Done`.
-- If the `linear_graphql` client-side tool extension is implemented, it is still part of the agent
-  toolchain rather than orchestrator business logic.
-
-## 12. Prompt Construction and Context Assembly
-
-### 12.1 Inputs
-
-Inputs to prompt rendering:
-
-- `workflow.prompt_template`
-- normalized `issue` object
-- OPTIONAL `attempt` integer (retry/continuation metadata)
-
-### 12.2 Rendering Rules
-
-- Render with strict variable checking.
-- Render with strict filter checking.
-- Convert issue object keys to strings for template compatibility.
-- Preserve nested arrays/maps (labels, blockers) so templates can iterate.
-
-### 12.3 Retry/Continuation Semantics
-
-`attempt` SHOULD be passed to the template because the workflow prompt can provide different
-instructions for:
-
-- first run (`attempt` null or absent)
-- continuation run after a successful prior session
-- retry after error/timeout/stall
-
-### 12.4 Failure Semantics
-
-If prompt rendering fails:
-
-- Fail the run attempt immediately.
-- Let the orchestrator treat it like any other worker failure and decide retry behavior.
-
-## 13. Logging, Status, and Observability
-
-### 13.1 Logging Conventions
-
-REQUIRED context fields for issue-related logs:
-
-- `issue_id`
-- `issue_identifier`
-
-REQUIRED context for coding-agent session lifecycle logs:
-
-- `session_id`
-
-Message formatting requirements:
-
-- Use stable `key=value` phrasing.
-- Include action outcome (`completed`, `failed`, `retrying`, etc.).
-- Include concise failure reason when present.
-- Avoid logging large raw payloads unless necessary.
-
-### 13.2 Logging Outputs and Sinks
-
-The spec does not prescribe where logs are written (stderr, file, remote sink, etc.).
-
-Requirements:
-
-- Operators MUST be able to see startup/validation/dispatch failures without attaching a debugger.
-- Implementations MAY write to one or more sinks.
-- If a configured log sink fails, the service SHOULD continue running when possible and emit an
-  operator-visible warning through any remaining sink.
-
-### 13.3 Runtime Snapshot / Monitoring Interface (OPTIONAL but RECOMMENDED)
-
-If the implementation exposes a synchronous runtime snapshot (for dashboards or monitoring), it
-SHOULD return:
-
-- `running` (list of running session rows)
-- each running row SHOULD include `turn_count`
-- `retrying` (list of retry queue rows)
-- `codex_totals`
-  - `input_tokens`
-  - `output_tokens`
-  - `total_tokens`
-  - `seconds_running` (aggregate runtime seconds as of snapshot time, including active sessions)
-- `rate_limits` (latest coding-agent rate limit payload, if available)
-
-RECOMMENDED snapshot error modes:
-
-- `timeout`
-- `unavailable`
-
-### 13.4 OPTIONAL Human-Readable Status Surface
-
-A human-readable status surface (terminal output, dashboard, etc.) is OPTIONAL and
-implementation-defined.
-
-If present, it SHOULD draw from orchestrator state/metrics only and MUST NOT be REQUIRED for
-correctness.
-
-### 13.5 Session Metrics and Token Accounting
-
-Token accounting rules:
-
-- Agent events can include token counts in multiple payload shapes.
-- Prefer absolute thread totals when available, such as:
-  - `thread/tokenUsage/updated` payloads
-  - `total_token_usage` within token-count wrapper events
-- Ignore delta-style payloads such as `last_token_usage` for dashboard/API totals.
-- Extract input/output/total token counts leniently from common field names within the selected
-  payload.
-- For absolute totals, track deltas relative to last reported totals to avoid double-counting.
-- Do not treat generic `usage` maps as cumulative totals unless the event type defines them that
-  way.
-- Accumulate aggregate totals in orchestrator state.
-
-Runtime accounting:
-
-- Runtime SHOULD be reported as a live aggregate at snapshot/render time.
-- Implementations MAY maintain a cumulative counter for ended sessions and add active-session
-  elapsed time derived from `running` entries (for example `started_at`) when producing a
-  snapshot/status view.
-- Add run duration seconds to the cumulative ended-session runtime when a session ends (normal exit
-  or cancellation/termination).
-- Continuous background ticking of runtime totals is not REQUIRED.
-
-Rate-limit tracking:
-
-- Track the latest rate-limit payload seen in any agent update.
-- Any human-readable presentation of rate-limit data is implementation-defined.
-
-### 13.6 Humanized Agent Event Summaries (OPTIONAL)
-
-Humanized summaries of raw agent protocol events are OPTIONAL.
-
-If implemented:
-
-- Treat them as observability-only output.
-- Do not make orchestrator logic depend on humanized strings.
-
-### 13.7 OPTIONAL HTTP Server Extension
-
-This section defines an OPTIONAL HTTP interface for observability and operational control.
-
-If implemented:
-
-- The HTTP server is an extension and is not REQUIRED for conformance.
-- The implementation MAY serve server-rendered HTML or a client-side application for the dashboard.
-- The dashboard/API MUST be observability/control surfaces only and MUST NOT become REQUIRED for
-  orchestrator correctness.
-
-Extension config:
-
-- `server.port` (integer, OPTIONAL)
-  - Enables the HTTP server extension.
-  - `0` requests an ephemeral port for local development and tests.
-  - CLI `--port` overrides `server.port` when both are present.
-
-Enablement (extension):
-
-- Start the HTTP server when a CLI `--port` argument is provided.
-- Start the HTTP server when `server.port` is present in `WORKFLOW.md` front matter.
-- The `server` top-level key is owned by this extension.
-- Positive `server.port` values bind that port.
-- Implementations SHOULD bind loopback by default (`127.0.0.1` or host equivalent) unless explicitly
-  configured otherwise.
-- Changes to HTTP listener settings (for example `server.port`) do not need to hot-rebind;
-  restart-required behavior is conformant.
-
-#### 13.7.1 Human-Readable Dashboard (`/`)
-
-- Host a human-readable dashboard at `/`.
-- The returned document SHOULD depict the current state of the system (for example active sessions,
-  retry delays, token consumption, runtime totals, recent events, and health/error indicators).
-- It is up to the implementation whether this is server-generated HTML or a client-side app that
-  consumes the JSON API below.
-
-#### 13.7.2 JSON REST API (`/api/v1/*`)
-
-Provide a JSON REST API under `/api/v1/*` for current runtime state and operational debugging.
-
-Minimum endpoints:
-
-- `GET /api/v1/state`
-  - Returns a summary view of the current system state (running sessions, retry queue/delays,
-    aggregate token/runtime totals, latest rate limits, and any additional tracked summary fields).
-  - Suggested response shape:
-
-    ```json
-    {
-      "generated_at": "2026-02-24T20:15:30Z",
-      "counts": {
-        "running": 2,
-        "retrying": 1
-      },
-      "running": [
-        {
-          "issue_id": "abc123",
-          "issue_identifier": "MT-649",
-          "state": "In Progress",
-          "session_id": "thread-1-turn-1",
-          "turn_count": 7,
-          "last_event": "turn_completed",
-          "last_message": "",
-          "started_at": "2026-02-24T20:10:12Z",
-          "last_event_at": "2026-02-24T20:14:59Z",
-          "tokens": {
-            "input_tokens": 1200,
-            "output_tokens": 800,
-            "total_tokens": 2000
-          }
-        }
-      ],
-      "retrying": [
-        {
-          "issue_id": "def456",
-          "issue_identifier": "MT-650",
-          "attempt": 3,
-          "due_at": "2026-02-24T20:16:00Z",
-          "error": "no available orchestrator slots"
-        }
-      ],
-      "codex_totals": {
-        "input_tokens": 5000,
-        "output_tokens": 2400,
-        "total_tokens": 7400,
-        "seconds_running": 1834.2
-      },
-      "rate_limits": null
-    }
-    ```
-
-- `GET /api/v1/<issue_identifier>`
-  - Returns issue-specific runtime/debug details for the identified issue, including any information
-    the implementation tracks that is useful for debugging.
-  - Suggested response shape:
-
-    ```json
-    {
-      "issue_identifier": "MT-649",
-      "issue_id": "abc123",
-      "status": "running",
-      "workspace": {
-        "path": "/tmp/symphony_workspaces/MT-649"
-      },
-      "attempts": {
-        "restart_count": 1,
-        "current_retry_attempt": 2
-      },
-      "running": {
-        "session_id": "thread-1-turn-1",
-        "turn_count": 7,
-        "state": "In Progress",
-        "started_at": "2026-02-24T20:10:12Z",
-        "last_event": "notification",
-        "last_message": "Working on tests",
-        "last_event_at": "2026-02-24T20:14:59Z",
-        "tokens": {
-          "input_tokens": 1200,
-          "output_tokens": 800,
-          "total_tokens": 2000
-        }
-      },
-      "retry": null,
-      "logs": {
-        "codex_session_logs": [
-          {
-            "label": "latest",
-            "path": "/var/log/symphony/codex/MT-649/latest.log",
-            "url": null
-          }
-        ]
-      },
-      "recent_events": [
-        {
-          "at": "2026-02-24T20:14:59Z",
-          "event": "notification",
-          "message": "Working on tests"
-        }
-      ],
-      "last_error": null,
-      "tracked": {}
-    }
-    ```
-
-  - If the issue is unknown to the current in-memory state, return `404` with an error response (for
-    example `{\"error\":{\"code\":\"issue_not_found\",\"message\":\"...\"}}`).
-
-- `POST /api/v1/refresh`
-  - Queues an immediate tracker poll + reconciliation cycle (best-effort trigger; implementations
-    MAY coalesce repeated requests).
-  - Suggested request body: empty body or `{}`.
-  - Suggested response (`202 Accepted`) shape:
-
-    ```json
-    {
-      "queued": true,
-      "coalesced": false,
-      "requested_at": "2026-02-24T20:15:30Z",
-      "operations": ["poll", "reconcile"]
-    }
-    ```
-
-API design notes:
-
-- The JSON shapes above are the RECOMMENDED baseline for interoperability and debugging ergonomics.
-- Implementations MAY add fields, but SHOULD avoid breaking existing fields within a version.
-- Endpoints SHOULD be read-only except for operational triggers like `/refresh`.
-- Unsupported methods on defined routes SHOULD return `405 Method Not Allowed`.
-- API errors SHOULD use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
-- If the dashboard is a client-side app, it SHOULD consume this API rather than duplicating state
-  logic.
-
-## 14. Failure Model and Recovery Strategy
-
-### 14.1 Failure Classes
-
-1. `Workflow/Config Failures`
-   - Missing `WORKFLOW.md`
-   - Invalid YAML front matter
-   - Unsupported tracker kind or missing tracker credentials/project slug
-   - Missing coding-agent executable
-
-2. `Workspace Failures`
-   - Workspace directory creation failure
-   - Workspace population/synchronization failure (implementation-defined; can come from hooks)
-   - Invalid workspace path configuration
-   - Hook timeout/failure
-
-3. `Agent Session Failures`
-   - Startup handshake failure
-   - Turn failed/cancelled
-   - Turn timeout
-   - User input requested and handled as failure by the implementation's documented policy
-   - Subprocess exit
-   - Stalled session (no activity)
-
-4. `Tracker Failures`
-   - API transport errors
-   - Non-200 status
-   - GraphQL errors
-   - malformed payloads
-
-5. `Observability Failures`
-   - Snapshot timeout
-   - Dashboard render errors
-   - Log sink configuration failure
-
-### 14.2 Recovery Behavior
-
-- Dispatch validation failures:
-  - Skip new dispatches.
-  - Keep service alive.
-  - Continue reconciliation where possible.
-
-- Worker failures:
-  - Convert to retries with exponential backoff.
-
-- Tracker candidate-fetch failures:
-  - Skip this tick.
-  - Try again on next tick.
-
-- Reconciliation state-refresh failures:
-  - Keep current workers.
-  - Retry on next tick.
-
-- Dashboard/log failures:
-  - Do not crash the orchestrator.
-
-### 14.3 Partial State Recovery (Restart)
-
-Current design is intentionally in-memory for scheduler state.
-Restart recovery means the service can resume useful operation by polling tracker state and reusing
-preserved workspaces. It does not mean retry timers, running sessions, or live worker state survive
-process restart.
-
-After restart:
-
-- No retry timers are restored from prior process memory.
-- No running sessions are assumed recoverable.
-- Service recovers by:
-  - startup terminal workspace cleanup
-  - fresh polling of active issues
-  - re-dispatching eligible work
-
-### 14.4 Operator Intervention Points
-
-Operators can control behavior by:
-
-- Editing `WORKFLOW.md` (prompt and most runtime settings).
-- `WORKFLOW.md` changes are detected and re-applied automatically without restart according to
-  Section 6.2.
-- Changing issue states in the tracker:
-  - terminal state -> running session is stopped and workspace cleaned when reconciled
-  - non-active state -> running session is stopped without cleanup
-- Restarting the service for process recovery or deployment (not as the normal path for applying
-  workflow config changes).
-
-## 15. Security and Operational Safety
-
-### 15.1 Trust Boundary Assumption
-
-Each implementation defines its own trust boundary.
-
-Operational safety requirements:
-
-- Implementations SHOULD state clearly whether they are intended for trusted environments, more
-  restrictive environments, or both.
-- Implementations SHOULD state clearly whether they rely on auto-approved actions, operator
-  approvals, stricter sandboxing, or some combination of those controls.
-- Workspace isolation and path validation are important baseline controls, but they are not a
-  substitute for whatever approval and sandbox policy an implementation chooses.
-
-### 15.2 Filesystem Safety Requirements
+## 9. Workspace Safety Requirements
 
 Mandatory:
 
 - Workspace path MUST remain under configured workspace root.
-- Coding-agent cwd MUST be the per-issue workspace path for the current run.
+- Repository path MUST remain under the issue workspace path.
+- Coding-agent cwd MUST be the repository path for the current run.
 - Workspace directory names MUST use sanitized identifiers.
+- Git remote MUST be derived from the configured GitLab project.
+- The service MUST reject workspace preparation if the existing remote points elsewhere and
+  `require_origin_match` is true.
 
-RECOMMENDED additional hardening for ports:
+RECOMMENDED hardening:
 
 - Run under a dedicated OS user.
 - Restrict workspace root permissions.
-- Mount workspace root on a dedicated volume if possible.
+- Use deploy keys or project-scoped tokens with the minimum required permissions.
+- Prefer protected branch rules that prevent direct pushes to the base branch.
 
-### 15.3 Secret Handling
+## 10. Agent Runner
+
+The agent runner MUST:
+
+1. Prepare the GitLab-backed workspace.
+2. Run `before_run` hook if configured.
+3. Start the coding-agent app-server in the repository path.
+4. Render prompt using strict template input.
+5. Run up to `agent.max_turns`.
+6. Stop the agent session on normal completion, error, timeout, cancellation, or ineligible issue
+   state.
+7. Run `after_run` hook best-effort.
+8. Push the work branch and create/update merge request on normal success when configured.
+
+The agent runner SHOULD refresh the GitLab issue between turns. If the issue becomes terminal or
+loses eligibility, the runner SHOULD stop before starting another turn.
+
+## 11. Client-Side GitLab Tools (OPTIONAL)
+
+If client-side tools are exposed to the coding-agent session, the default tool set SHOULD be narrow:
+
+- `gitlab_get_issue`
+- `gitlab_create_issue_note`
+- `gitlab_add_issue_labels`
+- `gitlab_remove_issue_labels`
+- `gitlab_list_issue_links`
+- `gitlab_get_merge_request`
+- `gitlab_create_or_update_merge_request`
+
+Tool scope requirements:
+
+- Tools MUST be restricted to the configured project unless an extension explicitly documents a
+  broader scope.
+- Tools MUST reuse the service GitLab auth policy.
+- Tools MUST redact tokens and secrets in errors.
+- Unsupported tool names MUST fail without stalling the session.
+
+A raw `gitlab_api` passthrough MAY be implemented as an extension, but it is not core conformance
+and MUST document permission and data-exposure risks.
+
+## 12. Observability
+
+Structured logs SHOULD include:
+
+- `project_id`
+- `project_path`
+- `issue_id`
+- `issue_iid`
+- `issue_identifier`
+- `workspace_path`
+- `repository_path`
+- `work_branch`
+- `merge_request_iid`
+- `session_id`
+- `attempt`
+- `event`
+- `error_class`
+
+Operator-visible events:
+
+- startup validation failures
+- GitLab project discovery failures
+- issue claim/release
+- worker start/exit
+- retry scheduling
+- workspace preparation failure
+- branch push failure
+- merge request creation/update
+- terminal issue cleanup
+
+Logging sink failures MUST NOT crash orchestration.
+
+## 13. Security and Trust
+
+### 13.1 GitLab Is Trusted but Not Harmless
+
+GitLab issue titles, descriptions, comments, branch names, and repository contents can contain
+untrusted or adversarial text. The service MUST NOT assume prompt input is safe simply because it
+comes from GitLab.
+
+### 13.2 Secret Handling
 
 - Support `$VAR` indirection in workflow config.
 - Do not log API tokens or secret env values.
 - Validate presence of secrets without printing them.
+- Redact tokens from Git remote URLs before logging.
 
-### 15.4 Hook Script Safety
+### 13.3 Git Remote Safety
+
+- Repository remotes MUST originate from configured GitLab project metadata.
+- The agent MUST NOT be launched in a repository whose origin points outside the configured GitLab
+  project when `require_origin_match` is true.
+- Implementations SHOULD avoid embedding tokens in persisted Git remote URLs. Prefer SSH keys,
+  credential helpers, or ephemeral askpass mechanisms.
+
+### 13.4 Hook Script Safety
 
 Workspace hooks are arbitrary shell scripts from `WORKFLOW.md`.
 
 Implications:
 
 - Hooks are fully trusted configuration.
-- Hooks run inside the workspace directory.
+- Hooks run inside the repository path unless a hook explicitly needs workspace path and the
+  implementation documents that behavior.
 - Hook output SHOULD be truncated in logs.
 - Hook timeouts are REQUIRED to avoid hanging the orchestrator.
 
-### 15.5 Harness Hardening Guidance
+### 13.5 Harness Hardening Guidance
 
-Running Codex agents against repositories, issue trackers, and other inputs that can contain
-sensitive data or externally-controlled content can be dangerous. A permissive deployment can lead
-to data leaks, destructive mutations, or full machine compromise if the agent is induced to execute
-harmful commands or use overly-powerful integrations.
-
-Implementations SHOULD explicitly evaluate their own risk profile and harden the execution harness
-where appropriate. This specification intentionally does not mandate a single hardening posture, but
-implementations SHOULD NOT assume that tracker data, repository contents, prompt inputs, or tool
-arguments are fully trustworthy just because they originate inside a normal workflow.
+Running coding agents against GitLab issues and repositories can lead to data leaks, destructive
+mutations, or machine compromise if a permissive deployment grants excessive credentials or command
+authority.
 
 Possible hardening measures include:
 
-- Tightening Codex approval and sandbox settings described elsewhere in this specification instead
-  of running with a maximally permissive configuration.
-- Adding external isolation layers such as OS/container/VM sandboxing, network restrictions, or
-  separate credentials beyond the built-in Codex policy controls.
-- Filtering which Linear issues, projects, teams, labels, or other tracker sources are eligible for
-  dispatch so untrusted or out-of-scope tasks do not automatically reach the agent.
-- Narrowing the `linear_graphql` tool so it can only read or mutate data inside the
-  intended project scope, rather than exposing general workspace-wide tracker access.
-- Reducing the set of client-side tools, credentials, filesystem paths, and network destinations
-  available to the agent to the minimum needed for the workflow.
+- Tightening Codex approval and sandbox settings.
+- Adding OS/container/VM isolation, network restrictions, or separate credentials.
+- Filtering eligible GitLab issues by labels, milestones, assignees, or author trust.
+- Restricting GitLab tokens to one project and minimum scopes.
+- Reducing client-side tools and filesystem paths available to the agent.
 
-The correct controls are deployment-specific, but implementations SHOULD document them clearly and
-treat harness hardening as part of the core safety model rather than an optional afterthought.
+## 14. Reference Algorithms
 
-## 16. Reference Algorithms (Language-Agnostic)
-
-### 16.1 Service Startup
+### 14.1 Service Startup
 
 ```text
 function start_service():
   configure_logging()
+  workflow = load_and_validate_workflow()
+  project = gitlab.fetch_project(workflow.gitlab.project)
   start_observability_outputs()
   start_workflow_watch(on_change=reload_and_reapply_workflow)
 
   state = {
     poll_interval_ms: get_config_poll_interval_ms(),
     max_concurrent_agents: get_config_max_concurrent_agents(),
+    project,
     running: {},
     claimed: set(),
     retry_attempts: {},
@@ -1701,11 +1174,10 @@ function start_service():
 
   startup_terminal_workspace_cleanup()
   schedule_tick(delay_ms=0)
-
   event_loop(state)
 ```
 
-### 16.2 Poll-and-Dispatch Tick
+### 14.2 Poll-and-Dispatch Tick
 
 ```text
 on_tick(state):
@@ -1718,9 +1190,9 @@ on_tick(state):
     schedule_tick(state.poll_interval_ms)
     return state
 
-  issues = tracker.fetch_candidate_issues()
+  issues = gitlab.fetch_candidate_issues(project=state.project)
   if issues failed:
-    log_tracker_error()
+    log_gitlab_error()
     notify_observers()
     schedule_tick(state.poll_interval_ms)
     return state
@@ -1730,6 +1202,10 @@ on_tick(state):
       break
 
     if should_dispatch(issue, state):
+      claim = gitlab.claim_issue(issue, running_label)
+      if claim failed:
+        log_claim_failure()
+        continue
       state = dispatch_issue(issue, state, attempt=null)
 
   notify_observers()
@@ -1737,7 +1213,7 @@ on_tick(state):
   return state
 ```
 
-### 16.3 Reconcile Active Runs
+### 14.3 Reconcile Active Runs
 
 ```text
 function reconcile_running_issues(state):
@@ -1747,15 +1223,15 @@ function reconcile_running_issues(state):
   if running_ids is empty:
     return state
 
-  refreshed = tracker.fetch_issue_states_by_ids(running_ids)
+  refreshed = gitlab.fetch_issues_by_ids_or_iids(running_ids)
   if refreshed failed:
     log_debug("keep workers running")
     return state
 
   for issue in refreshed:
-    if issue.state in terminal_states:
+    if issue is terminal:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=true)
-    else if issue.state in active_states:
+    else if issue is still eligible or has running_label:
       state.running[issue.id].issue = issue
     else:
       state = terminate_running_issue(state, issue.id, cleanup_workspace=false)
@@ -1763,69 +1239,30 @@ function reconcile_running_issues(state):
   return state
 ```
 
-### 16.4 Dispatch One Issue
-
-```text
-function dispatch_issue(issue, state, attempt):
-  worker = spawn_worker(
-    fn -> run_agent_attempt(issue, attempt, parent_orchestrator_pid) end
-  )
-
-  if worker spawn failed:
-    return schedule_retry(state, issue.id, next_attempt(attempt), {
-      identifier: issue.identifier,
-      error: "failed to spawn agent"
-    })
-
-  state.running[issue.id] = {
-    worker_handle,
-    monitor_handle,
-    identifier: issue.identifier,
-    issue,
-    session_id: null,
-    codex_app_server_pid: null,
-    last_codex_message: null,
-    last_codex_event: null,
-    last_codex_timestamp: null,
-    codex_input_tokens: 0,
-    codex_output_tokens: 0,
-    codex_total_tokens: 0,
-    last_reported_input_tokens: 0,
-    last_reported_output_tokens: 0,
-    last_reported_total_tokens: 0,
-    retry_attempt: normalize_attempt(attempt),
-    started_at: now_utc()
-  }
-
-  state.claimed.add(issue.id)
-  state.retry_attempts.remove(issue.id)
-  return state
-```
-
-### 16.5 Worker Attempt (Workspace + Prompt + Agent)
+### 14.4 Worker Attempt
 
 ```text
 function run_agent_attempt(issue, attempt, orchestrator_channel):
-  workspace = workspace_manager.create_for_issue(issue.identifier)
+  workspace = workspace_manager.prepare_gitlab_workspace(issue)
   if workspace failed:
     fail_worker("workspace error")
 
-  if run_hook("before_run", workspace.path) failed:
+  if run_hook("before_run", workspace.repository_path) failed:
     fail_worker("before_run hook error")
 
-  session = app_server.start_session(workspace=workspace.path)
+  session = app_server.start_session(workspace=workspace.repository_path)
   if session failed:
-    run_hook_best_effort("after_run", workspace.path)
+    run_hook_best_effort("after_run", workspace.repository_path)
     fail_worker("agent session startup error")
 
   max_turns = config.agent.max_turns
   turn_number = 1
 
   while true:
-    prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
+    prompt = build_turn_prompt(workflow_template, issue, workspace, attempt, turn_number, max_turns)
     if prompt failed:
       app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
+      run_hook_best_effort("after_run", workspace.repository_path)
       fail_worker("prompt error")
 
     turn_result = app_server.run_turn(
@@ -1837,18 +1274,11 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
 
     if turn_result failed:
       app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
+      run_hook_best_effort("after_run", workspace.repository_path)
       fail_worker("agent turn error")
 
-    refreshed_issue = tracker.fetch_issue_states_by_ids([issue.id])
-    if refreshed_issue failed:
-      app_server.stop_session(session)
-      run_hook_best_effort("after_run", workspace.path)
-      fail_worker("issue state refresh error")
-
-    issue = refreshed_issue[0] or issue
-
-    if issue.state is not active:
+    issue = gitlab.refresh_issue(issue)
+    if issue is not eligible for continuation:
       break
 
     if turn_number >= max_turns:
@@ -1857,12 +1287,19 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
     turn_number = turn_number + 1
 
   app_server.stop_session(session)
-  run_hook_best_effort("after_run", workspace.path)
+  run_hook_best_effort("after_run", workspace.repository_path)
+
+  if repository_has_changes_to_handoff(workspace):
+    git.push_work_branch(workspace)
+    merge_request = gitlab.create_or_update_merge_request(issue, workspace)
+    gitlab.mark_issue_review(issue, merge_request)
+  else:
+    gitlab.release_issue_after_noop(issue)
 
   exit_normal()
 ```
 
-### 16.6 Worker Exit and Retry Handling
+### 14.5 Worker Exit and Retry Handling
 
 ```text
 on_worker_exit(issue_id, reason, state):
@@ -1870,12 +1307,10 @@ on_worker_exit(issue_id, reason, state):
   state = add_runtime_seconds_to_totals(state, running_entry)
 
   if reason == normal:
-    state.completed.add(issue_id)  # bookkeeping only
-    state = schedule_retry(state, issue_id, 1, {
-      identifier: running_entry.identifier,
-      delay_type: continuation
-    })
+    state.completed.add(issue_id)
+    state.claimed.remove(issue_id)
   else:
+    gitlab.mark_issue_error(running_entry.issue, reason)
     state = schedule_retry(state, issue_id, next_attempt_from(running_entry), {
       identifier: running_entry.identifier,
       error: format("worker exited: %reason")
@@ -1885,34 +1320,7 @@ on_worker_exit(issue_id, reason, state):
   return state
 ```
 
-```text
-on_retry_timer(issue_id, state):
-  retry_entry = state.retry_attempts.pop(issue_id)
-  if missing:
-    return state
-
-  candidates = tracker.fetch_candidate_issues()
-  if fetch failed:
-    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
-      identifier: retry_entry.identifier,
-      error: "retry poll failed"
-    })
-
-  issue = find_by_id(candidates, issue_id)
-  if issue is null:
-    state.claimed.remove(issue_id)
-    return state
-
-  if available_slots(state) == 0:
-    return schedule_retry(state, issue_id, retry_entry.attempt + 1, {
-      identifier: issue.identifier,
-      error: "no available orchestrator slots"
-    })
-
-  return dispatch_issue(issue, state, attempt=retry_entry.attempt)
-```
-
-## 17. Test and Validation Matrix
+## 15. Test and Validation Matrix
 
 A conforming implementation SHOULD include tests that cover the behaviors defined in this
 specification.
@@ -1925,191 +1333,168 @@ Validation profiles:
 - `Real Integration Profile`: environment-dependent smoke/integration checks RECOMMENDED before
   production use.
 
-Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bullets that begin with
-`If ... is implemented` are `Extension Conformance`.
+### 15.1 Workflow and Config Parsing
 
-### 17.1 Workflow and Config Parsing
+- Workflow file path precedence works.
+- Workflow file changes are detected and trigger re-read/re-apply without restart.
+- Invalid workflow reload keeps last known good effective configuration.
+- Missing `WORKFLOW.md` returns typed error.
+- Invalid YAML front matter returns typed error.
+- Front matter non-map returns typed error.
+- Config defaults apply when OPTIONAL values are missing.
+- `gitlab.base_url`, `gitlab.api_token`, and `gitlab.project` validation works.
+- `$VAR` resolution works for GitLab API token and path values.
+- `~` path expansion works.
+- `codex.command` is preserved as a shell command string.
+- Prompt template renders `issue`, `project`, `repository`, `merge_request`, and `attempt`.
+- Prompt rendering fails on unknown variables.
 
-- Workflow file path precedence:
-  - explicit runtime path is used when provided
-  - cwd default is `WORKFLOW.md` when no explicit runtime path is provided
-- Workflow file changes are detected and trigger re-read/re-apply without restart
-- Invalid workflow reload keeps last known good effective configuration and emits an
-  operator-visible error
-- Missing `WORKFLOW.md` returns typed error
-- Invalid YAML front matter returns typed error
-- Front matter non-map returns typed error
-- Config defaults apply when OPTIONAL values are missing
-- `tracker.kind` validation enforces currently supported kind (`linear`)
-- `tracker.api_key` works (including `$VAR` indirection)
-- `$VAR` resolution works for tracker API key and path values
-- `~` path expansion works
-- `codex.command` is preserved as a shell command string
-- Per-state concurrency override map normalizes state names and ignores invalid values
-- Prompt template renders `issue` and `attempt`
-- Prompt rendering fails on unknown variables (strict mode)
+### 15.2 GitLab Client
 
-### 17.2 Workspace Manager and Safety
+- Project discovery normalizes project ID, path, default branch, and clone URLs.
+- Candidate issue fetch uses configured project, `state=opened`, and active labels.
+- Empty active labels are rejected unless unlabeled dispatch is enabled.
+- Pagination preserves order across multiple pages.
+- Labels are normalized for comparisons.
+- Priority labels and weights produce deterministic sorting.
+- Issue state refresh by ID/IID returns normalized issues.
+- Issue links produce `blocked_by` refs.
+- Open blockers prevent dispatch.
+- Closed or terminal blockers do not prevent dispatch.
+- Error mapping covers auth, permissions, not found, rate limit, conflict, server, network, and
+  malformed payloads.
 
-- Deterministic workspace path per issue identifier
-- Missing workspace directory is created
-- Existing workspace directory is reused
-- Existing non-directory path at workspace location is handled safely (replace or fail per
-  implementation policy)
-- OPTIONAL workspace population/synchronization errors are surfaced
-- `after_create` hook runs only on new workspace creation
-- `before_run` hook runs before each attempt and failure/timeouts abort the current attempt
-- `after_run` hook runs after each attempt and failure/timeouts are logged and ignored
-- `before_remove` hook runs on cleanup and failures/timeouts are ignored
-- Workspace path sanitization and root containment invariants are enforced before agent launch
-- Agent launch uses the per-issue workspace path as cwd and rejects out-of-root paths
+### 15.3 Workspace Manager and Repository Safety
 
-### 17.3 Issue Tracker Client
+- Deterministic workspace path per issue identifier.
+- Missing workspace directory is created.
+- Existing workspace directory is reused.
+- GitLab repository is cloned into configured subdirectory.
+- Existing repository origin is verified against configured GitLab project.
+- Mismatched origin fails before agent launch.
+- Base branch is fetched and checked out.
+- Work branch template renders deterministically and is sanitized.
+- Existing remote work branch is reused when configured.
+- `after_create`, `after_clone`, `before_run`, `after_run`, and `before_remove` hooks behave as
+  specified.
+- Agent launch uses repository path as cwd and rejects out-of-root paths.
 
-- Candidate issue fetch uses active states and project slug
-- Linear query uses the specified project filter field (`slugId`)
-- Empty `fetch_issues_by_states([])` returns empty without API call
-- Pagination preserves order across multiple pages
-- Blockers are normalized from inverse relations of type `blocks`
-- Labels are normalized to lowercase
-- Issue state refresh by ID returns minimal normalized issues
-- Issue state refresh query uses GraphQL ID typing (`[ID!]`) as specified in Section 11.2
-- Error mapping for request errors, non-200, GraphQL errors, malformed payloads
+### 15.4 Orchestrator Dispatch, Labels, Reconciliation, and Retry
 
-### 17.4 Orchestrator Dispatch, Reconciliation, and Retry
+- Dispatch sort order is priority, oldest creation time, then issue IID.
+- Eligible issue receives `running_label` before worker starts.
+- Issue with active blocker is not eligible.
+- Running issue losing eligibility stops without terminal workspace cleanup.
+- Closed issue or terminal label stops running agent and cleans workspace when configured.
+- Reconciliation with no running issues is a no-op.
+- Normal worker exit releases local claim and marks issue for review when handoff succeeds.
+- Abnormal worker exit marks issue error and schedules retry.
+- Retry backoff cap uses configured `agent.max_retry_backoff_ms`.
+- Stale `running_label` can be reclaimed only according to `claim_ttl_ms`.
+- Slot exhaustion requeues retries with explicit error reason.
 
-- Dispatch sort order is priority then oldest creation time
-- `Todo` issue with non-terminal blockers is not eligible
-- `Todo` issue with terminal blockers is eligible
-- Active-state issue refresh updates running entry state
-- Non-active state stops running agent without workspace cleanup
-- Terminal state stops running agent and cleans workspace
-- Reconciliation with no running issues is a no-op
-- Normal worker exit schedules a short continuation retry (attempt 1)
-- Abnormal worker exit increments retries with 10s-based exponential backoff
-- Retry backoff cap uses configured `agent.max_retry_backoff_ms`
-- Retry queue entries include attempt, due time, identifier, and error
-- Stall detection kills stalled sessions and schedules retry
-- Slot exhaustion requeues retries with explicit error reason
-- If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
-  limits
-- If a snapshot API is implemented, timeout/unavailable cases are surfaced
+### 15.5 Merge Request Handoff
 
-### 17.5 Coding-Agent App-Server Client
+- Work branch push occurs after normal success when configured.
+- Push failure fails the run and marks issue error.
+- Existing open merge request for source/target branch is reused.
+- New merge request uses configured title, description, draft flag, labels, source branch removal,
+  squash, assignee policy, source branch, and target branch.
+- Issue `running_label` is removed after handoff.
+- Issue `review_label` is added after handoff.
+- Issue note contains merge request URL when lifecycle notes are enabled.
 
-- Launch command uses workspace cwd and invokes `bash -lc <codex.command>`
+### 15.6 Coding-Agent App-Server Client
+
+- Launch command uses repository cwd and invokes `bash -lc <codex.command>`.
 - Session startup follows the targeted Codex app-server protocol.
-- Client identity/capability payloads are valid when the targeted Codex app-server protocol requires
-  them.
-- Policy-related startup payloads use the implementation's documented approval/sandbox settings
-- Thread and turn identities exposed by the targeted protocol are extracted and used to emit
-  `session_started`
-- Request/response read timeout is enforced
-- Turn timeout is enforced
-- Transport framing required by the targeted protocol is handled correctly
-- For stdio-based transports, diagnostic stderr handling is kept separate from the protocol stream
-- Command/file-change approvals are handled according to the implementation's documented policy
-- Unsupported dynamic tool calls are rejected without stalling the session
-- User input requests are handled according to the implementation's documented policy and do not
-  stall indefinitely
-- Usage and rate-limit telemetry exposed by the targeted protocol is extracted
-- Approval, user-input-required, usage, and rate-limit signals are interpreted according to the
-  targeted protocol
-- If client-side tools are implemented, session startup advertises the supported tool specs
-  using the targeted app-server protocol
-- If the `linear_graphql` client-side tool extension is implemented:
-  - the tool is advertised to the session
-  - valid `query` / `variables` inputs execute against configured Linear auth
-  - top-level GraphQL `errors` produce `success=false` while preserving the GraphQL body
-  - invalid arguments, missing auth, and transport failures return structured failure payloads
-  - unsupported tool names still fail without stalling the session
+- Policy-related startup payloads use the implementation's documented approval/sandbox settings.
+- Thread and turn identities are extracted and used to emit `session_started`.
+- Request/response read timeout is enforced.
+- Turn timeout is enforced.
+- Transport framing is handled correctly.
+- Diagnostic stderr is kept separate from the protocol stream.
+- Unsupported dynamic tool calls are rejected without stalling the session.
+- Usage and rate-limit telemetry is extracted when exposed by the targeted protocol.
+- If GitLab client-side tools are implemented, they are advertised with project-scoped tool specs.
 
-### 17.6 Observability
+### 15.7 Observability
 
-- Validation failures are operator-visible
-- Structured logging includes issue/session context fields
-- Logging sink failures do not crash orchestration
-- Token/rate-limit aggregation remains correct across repeated agent updates
-- If a human-readable status surface is implemented, it is driven from orchestrator state and does
-  not affect correctness
-- If humanized event summaries are implemented, they cover key wrapper/agent event classes without
-  changing orchestrator behavior
+- Validation failures are operator-visible.
+- Structured logging includes project, issue, workspace, branch, merge request, and session context.
+- Logging sink failures do not crash orchestration.
+- Token/rate-limit aggregation remains correct across repeated agent updates.
+- Lifecycle issue notes are emitted when enabled.
+- Issue notes redact secrets and tokens.
 
-### 17.7 CLI and Host Lifecycle
+### 15.8 CLI and Host Lifecycle
 
-- CLI accepts a positional workflow path argument (`path-to-WORKFLOW.md`)
-- CLI uses `./WORKFLOW.md` when no workflow path argument is provided
-- CLI errors on nonexistent explicit workflow path or missing default `./WORKFLOW.md`
-- CLI surfaces startup failure cleanly
-- CLI exits with success when application starts and shuts down normally
-- CLI exits nonzero when startup fails or the host process exits abnormally
+- CLI accepts a positional workflow path argument (`path-to-WORKFLOW.md`).
+- CLI uses `./WORKFLOW.md` when no workflow path argument is provided.
+- CLI errors on nonexistent explicit workflow path or missing default `./WORKFLOW.md`.
+- CLI surfaces startup failure cleanly.
+- CLI exits with success when application starts and shuts down normally.
+- CLI exits nonzero when startup fails or the host process exits abnormally.
 
-### 17.8 Real Integration Profile (RECOMMENDED)
+### 15.9 Real Integration Profile (RECOMMENDED)
 
-These checks are RECOMMENDED for production readiness and MAY be skipped in CI when credentials,
-network access, or external service permissions are unavailable.
-
-- A real tracker smoke test can be run with valid credentials supplied by `LINEAR_API_KEY` or a
-  documented local bootstrap mechanism (for example `~/.linear_api_key`).
-- Real integration tests SHOULD use isolated test identifiers/workspaces and clean up tracker
-  artifacts when practical.
+- A real GitLab smoke test can run with valid credentials supplied by `GITLAB_API_TOKEN`.
+- Real integration tests SHOULD use isolated test projects, labels, branches, and issues.
+- Tests SHOULD clean up temporary branches, merge requests, labels, and issues when practical.
 - A skipped real-integration test SHOULD be reported as skipped, not silently treated as passed.
 - If a real-integration profile is explicitly enabled in CI or release validation, failures SHOULD
   fail that job.
 
-## 18. Implementation Checklist (Definition of Done)
+## 16. Implementation Checklist
 
-Use the same validation profiles as Section 17:
+### 16.1 REQUIRED for Core Conformance
 
-- Section 18.1 = `Core Conformance`
-- Section 18.2 = `Extension Conformance`
-- Section 18.3 = `Real Integration Profile`
+- Workflow path selection supports explicit runtime path and cwd default.
+- `WORKFLOW.md` loader with YAML front matter plus prompt body split.
+- Typed config layer with defaults and `$` resolution.
+- Dynamic `WORKFLOW.md` watch/reload/re-apply for config and prompt.
+- GitLab client with project discovery, candidate issue fetch, state refresh, issue-link fetch,
+  label writes, issue notes, branch support, and merge-request support.
+- Polling orchestrator with single-authority mutable state.
+- Label-based claim/release lifecycle.
+- Workspace manager with sanitized per-issue workspaces.
+- GitLab repository clone/fetch/checkout from configured project only.
+- Work branch creation/reuse from configured branch template.
+- Workspace lifecycle hooks (`after_create`, `after_clone`, `before_run`, `after_run`,
+  `before_remove`).
+- Hook timeout config (`hooks.timeout_ms`, default `60000`).
+- Coding-agent app-server subprocess client.
+- Codex launch command config (`codex.command`, default `codex app-server`).
+- Strict prompt rendering with `issue`, `project`, `repository`, `merge_request`, and `attempt`.
+- Exponential retry queue.
+- Configurable retry backoff cap.
+- Reconciliation that stops runs on terminal/non-active GitLab issue state.
+- Merge request create/update handoff.
+- Structured logs with GitLab project, issue, branch, merge request, workspace, and session context.
+- Secret redaction for GitLab tokens and credential-bearing remotes.
 
-### 18.1 REQUIRED for Conformance
+### 16.2 RECOMMENDED Extensions
 
-- Workflow path selection supports explicit runtime path and cwd default
-- `WORKFLOW.md` loader with YAML front matter + prompt body split
-- Typed config layer with defaults and `$` resolution
-- Dynamic `WORKFLOW.md` watch/reload/re-apply for config and prompt
-- Polling orchestrator with single-authority mutable state
-- Issue tracker client with candidate fetch + state refresh + terminal fetch
-- Workspace manager with sanitized per-issue workspaces
-- Workspace lifecycle hooks (`after_create`, `before_run`, `after_run`, `before_remove`)
-- Hook timeout config (`hooks.timeout_ms`, default `60000`)
-- Coding-agent app-server subprocess client with JSON line protocol
-- Codex launch command config (`codex.command`, default `codex app-server`)
-- Strict prompt rendering with `issue` and `attempt` variables
-- Exponential retry queue with continuation retries after normal exit
-- Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
-- Reconciliation that stops runs on terminal/non-active tracker states
-- Workspace cleanup for terminal issues (startup sweep + active transition)
-- Structured logs with `issue_id`, `issue_identifier`, and `session_id`
-- Operator-visible observability (structured logs; OPTIONAL snapshot/status surface)
+- HTTP status snapshot endpoint with safe default bind host.
+- Project-scoped GitLab client-side tools for the coding agent.
+- Persistent retry queue and session metadata across process restarts.
+- Configurable observability sinks in workflow front matter.
+- Group-level project scanning for explicitly configured project allowlists.
+- Remote worker execution over SSH using the same GitLab-only project and repository constraints.
 
-### 18.2 RECOMMENDED Extensions (Not REQUIRED for Conformance)
+### 16.3 Operational Validation Before Production
 
-- HTTP server extension honors CLI `--port` over `server.port`, uses a safe default bind host, and
-  exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
-- `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
-  app-server session using configured Symphony auth.
-- TODO: Persist retry queue and session metadata across process restarts.
-- TODO: Make observability settings configurable in workflow front matter without prescribing UI
-  implementation details.
-- TODO: Add first-class tracker write APIs (comments/state transitions) in the orchestrator instead
-  of only via agent tools.
-- TODO: Add pluggable issue tracker adapters beyond Linear.
-
-### 18.3 Operational Validation Before Production (RECOMMENDED)
-
-- Run the `Real Integration Profile` from Section 17.8 with valid credentials and network access.
+- Run the real GitLab integration profile with valid credentials and isolated test resources.
+- Verify clone protocol, credential helper, and push permissions on the target host.
+- Verify protected branch settings prevent direct base-branch mutation.
 - Verify hook execution and workflow path resolution on the target host OS/shell environment.
-- If the OPTIONAL HTTP server is shipped, verify the configured port behavior and loopback/default
-  bind expectations on the target environment.
+- Verify merge request creation and label transitions in a non-production project before enabling
+  production dispatch.
 
 ## Appendix A. SSH Worker Extension (OPTIONAL)
 
-This appendix describes a common extension profile in which Symphony keeps one central
-orchestrator but executes worker runs on one or more remote hosts over SSH.
+This appendix describes an extension profile in which Symphony keeps one central orchestrator but
+executes worker runs on one or more remote hosts over SSH.
 
 Extension config:
 
@@ -2118,52 +1503,22 @@ Extension config:
 - `worker.max_concurrent_agents_per_host` (positive integer, OPTIONAL)
   - Shared per-host cap applied across configured SSH hosts.
 
-### A.1 Execution Model
+Execution model:
 
 - The orchestrator remains the single source of truth for polling, claims, retries, and
   reconciliation.
-- `worker.ssh_hosts` provides the candidate SSH destinations for remote execution.
-- Each worker run is assigned to one host at a time, and that host becomes part of the run's
-  effective execution identity along with the issue workspace.
-- `workspace.root` is interpreted on the remote host, not on the orchestrator host.
-- The coding-agent app-server is launched over SSH stdio instead of as a local subprocess, so the
-  orchestrator still owns the session lifecycle even though commands execute remotely.
+- Each remote host MUST satisfy the same GitLab project, token, clone, repository-origin, and
+  workspace-boundary requirements as local execution.
+- `workspace.root` is interpreted on the remote host.
+- The coding-agent app-server is launched over SSH stdio, but the orchestrator still owns session
+  lifecycle and GitLab label/MR state.
 - Continuation turns inside one worker lifetime SHOULD stay on the same host and workspace.
-- A remote host SHOULD satisfy the same basic contract as a local worker environment: reachable
-  shell, writable workspace root, coding-agent executable, and any required auth or repository
-  prerequisites.
 
-### A.2 Scheduling Notes
+Scheduling notes:
 
 - SSH hosts MAY be treated as a pool for dispatch.
-- Implementations MAY prefer the previously used host on retries when that host is still
-  available.
-- `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
-  hosts.
+- Implementations MAY prefer the previously used host on retries when that host is still available.
 - When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
   different execution mode.
-- Implementations MAY fail over to another host when the original host is unavailable before work
-  has meaningfully started.
 - Once a run has already produced side effects, a transparent rerun on another host SHOULD be
-  treated as a new attempt, not as invisible failover.
-
-### A.3 Problems to Consider
-
-- Remote environment drift:
-  - Each host needs the expected shell environment, coding-agent executable, auth, and repository
-    prerequisites.
-- Workspace locality:
-  - Workspaces are usually host-local, so moving an issue to a different host is typically a cold
-    restart unless shared storage exists.
-- Path and command safety:
-  - Remote path resolution, shell quoting, and workspace-boundary checks matter more once execution
-    crosses a machine boundary.
-- Startup and failover semantics:
-  - Implementations SHOULD distinguish host-connectivity/startup failures from in-workspace agent
-    failures so the same ticket is not accidentally re-executed on multiple hosts.
-- Host health and saturation:
-  - A dead or overloaded host SHOULD reduce available capacity, not cause duplicate execution or an
-    accidental fallback to local work.
-- Cleanup and observability:
-  - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
-    happened on the right machine.
+  treated as a new attempt, not invisible failover.
