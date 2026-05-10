@@ -1,41 +1,44 @@
-# Symphony
+# Symphony GitLab
 
-Symphony turns project work into isolated, autonomous implementation runs, allowing teams to manage
-work instead of supervising coding agents.
+Symphony is a GitLab-only coding-agent orchestration service implemented from `SPEC.md`.
 
-[![Symphony demo video preview](.github/media/symphony-demo-poster.jpg)](.github/media/symphony-demo.mp4)
+This repository currently provides a Python package and CLI with the core service pieces:
 
-_In this [demo video](.github/media/symphony-demo.mp4), Symphony monitors a Linear board for work and spawns agents to handle the tasks. The agents complete the tasks and provide proof of work: CI status, PR review feedback, complexity analysis, and walkthrough videos. When accepted, the agents land the PR safely. Engineers do not need to supervise Codex; they can manage the work at a higher level._
+- `WORKFLOW.md` loader with YAML front matter and strict prompt rendering.
+- Typed config defaults, `$VAR` token resolution, path normalization, and validation.
+- GitLab REST v4 client for project discovery, issues, labels, notes, issue links, and merge requests.
+- Per-issue workspace preparation with Git clone/fetch/branch checkout and origin safety checks.
+- Hook execution with timeouts.
+- Agent command runner launched in the checked-out repository path.
+- Poll/claim/run/MR-handoff/error-retry orchestration path.
+- CLI startup validation and long-running service entrypoint.
+- Bounded concurrent dispatch, app-server JSON-RPC client support, structured JSONL logging, and status snapshots.
 
-> [!WARNING]
-> Symphony is a low-key engineering preview for testing in trusted environments.
+## Quick Start
 
-## Running Symphony
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[test]'
+.venv/bin/python -m pytest -q
+```
 
-### Requirements
+Create a repository-owned `WORKFLOW.md`, set `GITLAB_API_TOKEN`, then validate:
 
-Symphony works best in codebases that have adopted
-[harness engineering](https://openai.com/index/harness-engineering/). Symphony is the next step --
-moving from managing coding agents to managing work that needs to get done.
+```bash
+export GITLAB_API_TOKEN=...
+.venv/bin/python -m symphony_gitlab path/to/WORKFLOW.md --validate-only
+```
 
-### Option 1. Make your own
+Run the service:
 
-Tell your favorite coding agent to build Symphony in a programming language of your choice:
+```bash
+.venv/bin/python -m symphony_gitlab path/to/WORKFLOW.md
+```
 
-> Implement Symphony according to the following spec:
-> https://github.com/openai/symphony/blob/main/SPEC.md
+## Current Scope
 
-### Option 2. Use our experimental reference implementation
+The implementation is intentionally conservative: it keeps a local worker model with a bounded thread pool and clear module boundaries for persistence, richer status surfaces, and remote workers later. It does not add a web UI or non-GitLab task sources.
 
-Check out [elixir/README.md](elixir/README.md) for instructions on how to set up your environment
-and run the Elixir-based Symphony implementation. You can also ask your favorite coding agent to
-help with the setup:
+Implementation-defined lifecycle policy: after a successful handoff, Symphony removes the configured active labels from the issue, removes `symphony:running`, and adds `symphony:review`. This prevents the same issue from being selected again on the next poll while the merge request is waiting for review.
 
-> Set up Symphony for my repository based on
-> https://github.com/openai/symphony/blob/main/elixir/README.md
-
----
-
-## License
-
-This project is licensed under the [Apache License 2.0](LICENSE).
+See [CONFORMANCE.md](CONFORMANCE.md) for the implemented core behavior and explicit implementation-defined policies.
